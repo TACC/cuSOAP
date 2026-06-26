@@ -440,6 +440,11 @@ class SOAP:
             raise ImportError("sphericart.torch is required. Install/build sphericart with torch bindings.") from e
         self._sct = sct
         self._Y = sct.SphericalHarmonics(self._l_max)
+        # Real *solid* harmonics r^l Y_lm and their exact Cartesian gradients
+        # (used by the closed-form analytical derivative). By construction
+        # SolidHarmonics(xyz) == |xyz|^l * SphericalHarmonics(xyz/|xyz|), so it is
+        # consistent with the forward pass to machine precision.
+        self._Ysolid = sct.SolidHarmonics(self._l_max)
 
     # ---- basis ----
 
@@ -691,7 +696,14 @@ class SOAP:
         - If `torch_cluster` is available, use `torch_cluster.radius`.
         - Otherwise use chunked GEMM distance: dist2 = ||c||^2 + ||n||^2 - 2 c·n,
           reusing a cached (chunk,M) scratch buffer.
+
+        Note: this routine only produces (integer) edge indices, so it never needs
+        gradients. We detach the inputs here so the in-place / out=-argument GEMM
+        optimizations below are compatible with an autograd-enabled forward pass
+        (the differentiable `rvec` is rebuilt from these indices by the caller).
         """
+        centers = centers.detach()
+        neigh_pos = neigh_pos.detach()
         try:
             from torch_cluster import radius
             self._last_nl_backend = "torch_cluster"
@@ -1336,6 +1348,263 @@ class SOAP:
 
         return (deriv, desc0) if return_descriptor else deriv
 
+    # ---- Public: derivatives (analytical) ----
+
+    def derivatives_analytical(
+        self,
+        system: Any,
+        centers: Optional[Sequence[Any]] = None,
+        include: Optional[Sequence[int]] = None,
+        exclude: Optional[Sequence[int]] = None,
+        return_descriptor: bool = True,
+        attach: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Exact analytical derivatives of the descriptor w.r.t. atomic coordinates,
+        obtained by reverse-mode automatic differentiation of the (fully
+        differentiable) forward pass.
+
+        Every step of the forward pass -- sphericart real spherical harmonics, the
+        GTO/polynomial radial factors, the Loewdin orthonormalization, the density
+        projection c_{nlm}, the analytic self-term and the power spectrum -- is built
+        from differentiable torch ops, so AD returns the *exact* gradient, not a
+        finite-difference approximation. For average='cc' this is precisely
+        d c_{nlm}/d x_j as derived in SOAP.pdf; for the power-spectrum averages it is
+        that gradient propagated through p = sum_m c_{nlm} c'_{nlm}.
+
+        Output follows the DScribe convention:
+            (n_centers, n_atoms_included, 3, n_features)
+
+        Notes
+        -----
+        * When a center is given as an atom index, its position is tied to that atom
+          in the autograd graph, so the "center moves with the atom" term (the
+          on-diagonal force contribution) is included automatically, matching the
+          DScribe analytical convention. `attach` is accepted for API parity but is
+          a no-op here (this behaviour is automatic and always on for index centers).
+        * The neighbor search is a cutoff test that yields only integer indices, so it
+          is non-differentiable by nature; the descriptor is exactly differentiable
+          everywhere except on the measure-zero cutoff shell, exactly as in DScribe.
+        """
+        positions, Z, cell, pbc = system_to_tensors(system, self.device, self.dtype)
+        n_atoms = int(positions.shape[0])
+
+        bad = set(torch.unique(Z).tolist()) - self._atomic_number_set
+        if bad:
+            raise ValueError(f"System contains atomic numbers not in species list: {sorted(bad)}")
+
+        # included atoms (atoms we differentiate w.r.t.)
+        if include is None:
+            idx = list(range(n_atoms))
+        else:
+            idx = [int(i) for i in include]
+        if exclude is not None:
+            ex = set(int(i) for i in exclude)
+            idx = [i for i in idx if i not in ex]
+        idx_t = torch.tensor(idx, device=self.device, dtype=torch.long)
+
+        # Differentiable leaf for the positions, fed through the normal forward pass.
+        pos = positions.detach().clone().requires_grad_(True)
+        sys_t: Dict[str, Any] = {"positions": pos, "atomic_numbers": Z}
+        if self.periodic:
+            sys_t["cell"] = cell
+            sys_t["pbc"] = pbc
+
+        # number of centers (needed to broadcast for the global-average modes)
+        centers_xyz, _ = self.prepare_centers(pos, centers)
+        n_centers = int(centers_xyz.shape[0])
+
+        desc = self.create(sys_t, centers)
+        if self.sparse:
+            desc = desc.to_dense()
+        global_avg = (desc.dim() == 1)            # 'inner'/'outer' reduce over centers
+        desc2 = desc[None, :] if global_avg else desc   # (R, n_feat)
+        R = int(desc2.shape[0])
+        n_feat = int(desc2.shape[1])
+        P = R * n_feat
+
+        # Full Jacobian d desc2 / d pos.  Try one vectorized (batched) reverse pass;
+        # fall back to a per-output loop if batched AD is unsupported by a custom op.
+        try:
+            eye = torch.eye(P, device=self.device, dtype=self.dtype).reshape(P, R, n_feat)
+            jac = torch.autograd.grad(
+                desc2, pos, grad_outputs=eye, is_grads_batched=True, retain_graph=True
+            )[0]
+            jac = jac.reshape(R, n_feat, n_atoms, 3)
+        except Exception:
+            jac = torch.zeros((R, n_feat, n_atoms, 3), device=self.device, dtype=self.dtype)
+            flat = desc2.reshape(-1)
+            jflat = jac.view(P, n_atoms, 3)
+            for p in range(P):
+                g = torch.autograd.grad(flat[p], pos, retain_graph=True)[0]
+                jflat[p] = g
+
+        # (R, n_feat, n_atoms, 3) -> select included atoms -> (R, n_inc, 3, n_feat)
+        jac_sel = jac[:, :, idx_t, :].permute(0, 2, 3, 1).contiguous()
+        if global_avg:
+            deriv = jac_sel.expand(n_centers, len(idx), 3, n_feat).contiguous()
+        else:
+            deriv = jac_sel
+
+        if return_descriptor:
+            return deriv, desc.detach()
+        return deriv
+
+    def derivatives_analytical_closed_form(
+        self,
+        system: Any,
+        centers: Optional[Sequence[Any]] = None,
+        include: Optional[Sequence[int]] = None,
+        exclude: Optional[Sequence[int]] = None,
+        return_descriptor: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Explicit closed-form analytical derivative of the projection coefficients
+        c_{nlm} -- a direct implementation of the formula derived in SOAP.pdf:
+
+            d c_{nlm}/d x_j = sum_i sum_k (2π)^{3/2} σ^3 β^l_{nk}/(1+2σ^2 α_kl)^{l+3/2}
+                              · d/dx_j [ r_i^l Y_lm(r̂_i) e^{-α_kl r_i^2/(1+2σ^2 α_kl)} ]
+
+        The bracket is split exactly as
+            d/dx [ r^l Y_lm(r̂) e^{-γ r^2} ]
+                = e^{-γ r^2} · d/dx[ r^l Y_lm(r̂) ]            (solid-harmonic gradient)
+                  + ( -2 γ x ) · r^l Y_lm(r̂) · e^{-γ r^2}     (Gaussian-width term)
+        with γ = α_kl/(1+2σ^2 α_kl).  The solid-harmonic gradient d/dx[r^l Y_lm] is
+        obtained directly and exactly from sphericart (SolidHarmonics), so we use the
+        real-harmonic gradient that is consistent with the forward pass instead of the
+        complex-harmonic recurrence written in the PDF (the two are equivalent; the
+        real form is what the code actually evaluates).
+
+        The position-independent self-term (the δ_{l0} contribution of the central
+        Gaussian at r=0) drops out of the derivative.
+
+        Restricted to rbf='gto', average='cc', non-periodic, weighting=None -- the
+        setting of the SOAP.pdf derivation and of the force-prediction descriptor.
+        For anything else use derivatives_analytical (autograd), which is general.
+
+        Output: (n_centers, n_atoms_included, 3, n_features), DScribe convention.
+        """
+        if self._rbf != "gto":
+            raise NotImplementedError("closed-form derivative needs rbf='gto'; use derivatives_analytical.")
+        if self.average != "cc":
+            raise NotImplementedError("closed-form derivative needs average='cc'; use derivatives_analytical.")
+        if self.periodic:
+            raise NotImplementedError("closed-form derivative is non-periodic; use derivatives_analytical.")
+        if self._weighting is not None:
+            raise NotImplementedError("closed-form derivative assumes weighting=None; use derivatives_analytical.")
+
+        positions, Z, cell, pbc = system_to_tensors(system, self.device, self.dtype)
+        device, dtype = positions.device, positions.dtype
+        n_atoms = int(positions.shape[0])
+
+        bad = set(torch.unique(Z).tolist()) - self._atomic_number_set
+        if bad:
+            raise ValueError(f"System contains atomic numbers not in species list: {sorted(bad)}")
+
+        # included atoms and their position on output axis 1
+        if include is None:
+            idx = list(range(n_atoms))
+        else:
+            idx = [int(i) for i in include]
+        if exclude is not None:
+            ex = set(int(i) for i in exclude)
+            idx = [i for i in idx if i not in ex]
+        n_inc = len(idx)
+        inv = torch.full((n_atoms,), -1, device=device, dtype=torch.long)  # atom -> out row (or -1)
+        for out_pos, a in enumerate(idx):
+            inv[a] = out_pos
+
+        centers_xyz, center_indices = self.prepare_centers(positions, centers)
+        n_centers = int(centers_xyz.shape[0])
+
+        S = self.n_species
+        nmax = self._n_max
+        Lp1 = self._l_max + 1
+        L = Lp1 * Lp1
+        n_feat = S * nmax * L
+
+        deriv = torch.zeros((n_centers, n_inc, 3, n_feat), device=device, dtype=dtype)
+        desc0 = self.create(system, centers).detach() if return_descriptor else None
+
+        # ---- neighbor list that *keeps* the neighbor atom index (non-periodic) ----
+        eps_self = 1e-8 if dtype == torch.float32 else 1e-12
+        center_idx, neigh_idx = self._radius_edges(centers_xyz, positions, self._cutoff)
+        if center_idx.numel() > 0:
+            rvec = positions[neigh_idx] - centers_xyz[center_idx]
+            r = torch.linalg.norm(rvec, dim=-1)
+            keep = r > eps_self
+            center_idx, neigh_idx, rvec, r = center_idx[keep], neigh_idx[keep], rvec[keep], r[keep]
+        E = int(center_idx.numel())
+
+        if E == 0:
+            return (deriv, desc0) if return_descriptor else deriv
+
+        neigh_sp = self._map_Z_to_species(Z[neigh_idx])  # (E,) species column for each edge
+
+        const = self._get_const(device, dtype)
+        alphas = const["alphas"]   # (Lp1, nmax)
+        betas = const["betas"]     # (Lp1, nmax, nmax)
+        eta = const["eta"]
+        r2 = r * r
+
+        # B[e,n,l]   = sum_k beta^l_{nk} * pref_kl * e^{-gamma_kl r^2}              (radial, no r^l)
+        # Bhat[e,n,l]= sum_k beta^l_{nk} * (-2 gamma_kl) * pref_kl * e^{-gamma_kl r^2}
+        B = torch.zeros((E, nmax, Lp1), device=device, dtype=dtype)
+        Bhat = torch.zeros((E, nmax, Lp1), device=device, dtype=dtype)
+        for l in range(Lp1):
+            alpha_l = alphas[l]                 # (nmax,)
+            beta_l = betas[l]                   # (nmax,nmax)
+            p = alpha_l + eta                   # (nmax,)
+            gamma = alpha_l * eta / p           # (nmax,)  == alpha/(1+2 sigma^2 alpha)
+            pref = (math.pi ** 1.5) * (eta / p) ** l * (p ** (-1.5))   # (nmax,)
+            Q = pref[None, :] * torch.exp(-gamma[None, :] * r2[:, None])  # (E,nmax)
+            B[:, :, l] = Q @ beta_l.transpose(0, 1)
+            Bhat[:, :, l] = (-2.0 * gamma[None, :] * Q) @ beta_l.transpose(0, 1)
+
+        # expand l -> (l,m) columns
+        l_of_lm = torch.tensor(
+            [l for l in range(Lp1) for _ in range(2 * l + 1)], device=device, dtype=torch.long
+        )  # (L,)
+        B_lm = B[:, :, l_of_lm]       # (E, nmax, L)
+        Bhat_lm = Bhat[:, :, l_of_lm]  # (E, nmax, L)
+
+        # real solid harmonics r^l Y_lm and their exact Cartesian gradients
+        Yval, Ygrad = self._Ysolid.compute_with_gradients(rvec)  # (E,L), (E,3,L)
+
+        # edge gradient  g[e,d,n,lm] = d/dr_d ( B_lm * Yval )
+        #   = (r_d * Bhat_lm) * Yval     (Gaussian-width term)
+        #   +  B_lm * dYval/dr_d         (solid-harmonic term)
+        term_gauss = rvec[:, :, None, None] * (Bhat_lm[:, None, :, :] * Yval[:, None, None, :])
+        term_solid = B_lm[:, None, :, :] * Ygrad[:, :, None, :]
+        g = term_gauss + term_solid  # (E, 3, nmax, L)
+
+        # ---- scatter edge gradients to (center, atom, component, species, n, lm) ----
+        # d r_vec/d R_neigh = +I ;  d r_vec/d R_center_atom = -I
+        deriv_flat = torch.zeros((n_centers * n_inc * S, 3, nmax, L), device=device, dtype=dtype)
+
+        op_n = inv[neigh_idx]                       # out row of the neighbor atom (or -1)
+        valid_n = op_n >= 0
+        t_n = (center_idx * n_inc + op_n) * S + neigh_sp
+        if torch.any(valid_n):
+            deriv_flat.index_add_(0, t_n[valid_n], g[valid_n])
+
+        a_c = center_indices[center_idx]            # atom index of each edge's center (or -1)
+        op_c = torch.where(a_c >= 0, inv[a_c.clamp(min=0)], torch.full_like(a_c, -1))
+        valid_c = op_c >= 0
+        t_c = (center_idx * n_inc + op_c) * S + neigh_sp
+        if torch.any(valid_c):
+            deriv_flat.index_add_(0, t_c[valid_c], -g[valid_c])
+
+        # (n_centers, n_inc, S, 3, nmax, L) -> (n_centers, n_inc, 3, S, nmax, L) -> features
+        deriv = (
+            deriv_flat.reshape(n_centers, n_inc, S, 3, nmax, L)
+            .permute(0, 1, 3, 2, 4, 5)
+            .reshape(n_centers, n_inc, 3, n_feat)
+            .contiguous()
+        )
+
+        return (deriv, desc0) if return_descriptor else deriv
+
     def derivatives(
         self,
         system: Any,
@@ -1349,16 +1618,36 @@ class SOAP:
         only_physical_cores: bool = False,
         verbose: bool = False,
     ):
-        # DScribe auto->numerical for this version
-        return self.derivatives_numerical(
-            system=system,
-            centers=centers,
-            include=include,
-            exclude=exclude,
-            method=method,
-            return_descriptor=return_descriptor,
-            attach=attach,
-            n_jobs=n_jobs,
-            only_physical_cores=only_physical_cores,
-            verbose=verbose,
-        )
+        """
+        Dispatch to the requested derivative backend (DScribe-like `method`):
+
+          - "numerical"  : central finite differences (derivatives_numerical).
+          - "analytical" : exact autograd derivatives (derivatives_analytical),
+                           general over rbf / average / periodic.
+          - "auto"       : analytical when supported (here: always, since the autograd
+                           path is general), else numerical -- mirroring DScribe, which
+                           prefers analytical for SOAP.
+        """
+        if method == "numerical":
+            return self.derivatives_numerical(
+                system=system,
+                centers=centers,
+                include=include,
+                exclude=exclude,
+                method="numerical",
+                return_descriptor=return_descriptor,
+                attach=attach,
+                n_jobs=n_jobs,
+                only_physical_cores=only_physical_cores,
+                verbose=verbose,
+            )
+        if method in ("auto", "analytical"):
+            return self.derivatives_analytical(
+                system=system,
+                centers=centers,
+                include=include,
+                exclude=exclude,
+                return_descriptor=return_descriptor,
+                attach=attach,
+            )
+        raise ValueError("method must be one of: 'auto', 'analytical', 'numerical'.")
