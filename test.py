@@ -36,4 +36,3 @@ for iatom in range(num_atoms):
  pytorch_soap_derivatives = pytorch_soap.derivatives(system=molecule, centers=[iatom], method="numerical", return_descriptor=False)
  print("SOAP_Tensor: ",pytorch_soap_tensor)
  print("SOAP_Derivatives: ",pytorch_soap_derivatives)
-
