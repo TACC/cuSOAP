@@ -24,8 +24,244 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import math
+import os
 import time
 import torch
+
+# -----------------------------
+# Optional Triton (fused CUDA kernel for the density-coefficient accumulation)
+# -----------------------------
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except Exception:
+    triton = None
+    tl = None
+    _HAS_TRITON = False
+
+def _ensure_triton_ptxas() -> None:
+    """On very new GPUs (e.g. GB10 / sm_121) triton's bundled ptxas may not know the
+    architecture. torch ships a ptxas matching its CUDA build; prefer it, then the
+    system CUDA toolkit."""
+    if os.environ.get("TRITON_PTXAS_PATH"):
+        return
+    for cand in (
+        os.path.join(os.path.dirname(torch.__file__), "bin", "ptxas"),
+        "/usr/local/cuda/bin/ptxas",
+    ):
+        if os.path.exists(cand):
+            os.environ["TRITON_PTXAS_PATH"] = cand
+            return
+
+
+if _HAS_TRITON:
+
+    @triton.jit(do_not_specialize=["E_tot"])
+    def _soap_gto_acc_kernel(
+        r_ptr, w_ptr, y_ptr, rowptr_ptr,
+        g_ptr, pref_ptr,          # (NMAX,) radial constants for this l
+        acc_ptr,                  # (n_rows, NMAX, LM_TOT) output; writes slice [LM0:LM0+ML]
+        E_tot,                    # total number of edges (= row stride of transposed Y)
+        L: tl.constexpr,          # current angular momentum l
+        ML: tl.constexpr,         # 2l+1
+        MLP: tl.constexpr,        # next_pow2(ML)
+        NMAX: tl.constexpr,
+        NMAXP: tl.constexpr,      # next_pow2(NMAX)
+        LM_TOT: tl.constexpr,     # (l_max+1)^2, columns of acc last dim
+        LM0: tl.constexpr,        # l*l column offset
+        BLOCK_E: tl.constexpr,
+        HAS_W: tl.constexpr,
+    ):
+        # One program per (center,species) row: segmented reduction over the row's
+        # edge range [rowptr[row], rowptr[row+1]).  For each edge e:
+        #   prim[e,n] = w_e * PREF[n] * r_e^L * exp(-G[n] * r_e^2)
+        #   acc[row,n,lm] += prim[e,n] * Y[e, LM0+m]
+        # Accumulation stays in registers -> no atomics, no (E,nmax,2l+1) intermediate.
+        row = tl.program_id(0)
+        start = tl.load(rowptr_ptr + row)
+        end = tl.load(rowptr_ptr + row + 1)
+
+        n_offs = tl.arange(0, NMAXP)
+        n_mask = n_offs < NMAX
+        m_offs = tl.arange(0, MLP)
+        m_mask = m_offs < ML
+
+        G = tl.load(g_ptr + n_offs, mask=n_mask, other=0.0)
+        PREF = tl.load(pref_ptr + n_offs, mask=n_mask, other=0.0)
+
+        acc = tl.zeros((NMAXP, MLP), dtype=tl.float32)
+
+        for s in range(start, end, BLOCK_E):
+            e_offs = s + tl.arange(0, BLOCK_E)
+            e_mask = e_offs < end
+            r = tl.load(r_ptr + e_offs, mask=e_mask, other=0.0)
+            r2 = r * r
+            rl = tl.full((BLOCK_E,), 1.0, dtype=tl.float32)
+            for _ in tl.static_range(L):
+                rl = rl * r
+            if HAS_W:
+                wv = tl.load(w_ptr + e_offs, mask=e_mask, other=0.0)
+            else:
+                wv = tl.full((BLOCK_E,), 1.0, dtype=tl.float32)
+            prim = wv[:, None] * rl[:, None] * PREF[None, :] * tl.exp(-G[None, :] * r2[:, None])
+            prim = tl.where(e_mask[:, None] & n_mask[None, :], prim, 0.0)
+            # Y is stored transposed (LM_TOT, E_tot) for coalesced access.
+            y = tl.load(
+                y_ptr + (LM0 + m_offs)[None, :] * E_tot + e_offs[:, None],
+                mask=e_mask[:, None] & m_mask[None, :], other=0.0,
+            )
+            acc += tl.sum(prim[:, :, None] * y[:, None, :], axis=0)
+
+        out_ptrs = acc_ptr + row * (NMAX * LM_TOT) + n_offs[:, None] * LM_TOT + (LM0 + m_offs)[None, :]
+        tl.store(out_ptrs, acc, mask=n_mask[:, None] & m_mask[None, :])
+
+    @triton.jit(do_not_specialize=["E"])
+    def _ylm_all_kernel(u_ptr, nrm_ptr, out_ptr, E,
+                        LMAX: tl.constexpr, BLOCK_E: tl.constexpr):
+        # Real spherical harmonics for all (l,m) up to LMAX, in the sphericart
+        # convention (orthonormal, no Condon-Shortley phase), via Cartesian
+        # recurrences:
+        #   A_m + i B_m = (x + i y)^m
+        #   Ptilde_l^m(z) = P_l^m(z) / sin^m(theta)   (polynomial in z)
+        #   Y_l^{+m} = N_lm Ptilde_l^m A_m ; Y_l^{-m} = N_lm Ptilde_l^m B_m
+        # Output is transposed, (LMAX+1)^2 x E, so stores are coalesced.
+        pid = tl.program_id(0)
+        e_offs = pid * BLOCK_E + tl.arange(0, BLOCK_E)
+        e_mask = e_offs < E
+        x = tl.load(u_ptr + e_offs * 3 + 0, mask=e_mask, other=0.0)
+        y = tl.load(u_ptr + e_offs * 3 + 1, mask=e_mask, other=0.0)
+        z = tl.load(u_ptr + e_offs * 3 + 2, mask=e_mask, other=1.0)
+
+        A = tl.full((BLOCK_E,), 1.0, dtype=tl.float32)
+        B = tl.zeros((BLOCK_E,), dtype=tl.float32)
+        dfact = 1.0
+
+        for m in tl.static_range(0, LMAX + 1):
+            p_prev = tl.full((BLOCK_E,), 0.0, dtype=tl.float32) + dfact  # Ptilde_mm (l=m)
+            n_lm = tl.load(nrm_ptr + m * (LMAX + 1) + m)
+            tl.store(out_ptr + (m * m + 2 * m) * E + e_offs, n_lm * p_prev * A, mask=e_mask)
+            if m > 0:
+                tl.store(out_ptr + (m * m) * E + e_offs, n_lm * p_prev * B, mask=e_mask)
+            if m < LMAX:
+                p_curr = (2.0 * m + 1.0) * z * p_prev  # Ptilde_{m+1,m}
+                l1 = m + 1
+                n_lm = tl.load(nrm_ptr + l1 * (LMAX + 1) + m)
+                tl.store(out_ptr + (l1 * l1 + l1 + m) * E + e_offs, n_lm * p_curr * A, mask=e_mask)
+                if m > 0:
+                    tl.store(out_ptr + (l1 * l1 + l1 - m) * E + e_offs, n_lm * p_curr * B, mask=e_mask)
+                for ll in tl.static_range(m + 2, LMAX + 1):
+                    p_next = ((2.0 * ll - 1.0) * z * p_curr - (ll + m - 1.0) * p_prev) / (ll - m)
+                    p_prev = p_curr
+                    p_curr = p_next
+                    n_lm = tl.load(nrm_ptr + ll * (LMAX + 1) + m)
+                    tl.store(out_ptr + (ll * ll + ll + m) * E + e_offs, n_lm * p_curr * A, mask=e_mask)
+                    if m > 0:
+                        tl.store(out_ptr + (ll * ll + ll - m) * E + e_offs, n_lm * p_curr * B, mask=e_mask)
+            A_new = x * A - y * B
+            B_new = x * B + y * A
+            A = A_new
+            B = B_new
+            dfact = dfact * (2.0 * m + 1.0)
+
+    @triton.jit(do_not_specialize=["C", "M"])
+    def _nl_count_kernel(
+        cx_ptr, cy_ptr, cz_ptr, nx_ptr, ny_ptr, nz_ptr, nsp_ptr, counts_ptr,
+        C, M, cutoff2, eps2,
+        S: tl.constexpr, SP: tl.constexpr,
+        BLOCK_C: tl.constexpr, BLOCK_M: tl.constexpr,
+    ):
+        # Pass 1 of the fused neighbor search: brute-force distance test of a block
+        # of centers against all neighbor candidates, counting hits per
+        # (center, species) row. Positions come in SoA layout for coalesced loads.
+        pid = tl.program_id(0)
+        c_offs = pid * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < C
+        cx = tl.load(cx_ptr + c_offs, mask=c_mask, other=1e30)
+        cy = tl.load(cy_ptr + c_offs, mask=c_mask, other=1e30)
+        cz = tl.load(cz_ptr + c_offs, mask=c_mask, other=1e30)
+
+        svec = tl.arange(0, SP)
+        counts = tl.zeros((BLOCK_C, SP), dtype=tl.int32)
+
+        for m0 in range(0, M, BLOCK_M):
+            m_offs = m0 + tl.arange(0, BLOCK_M)
+            m_mask = m_offs < M
+            nx = tl.load(nx_ptr + m_offs, mask=m_mask, other=-1e30)
+            ny = tl.load(ny_ptr + m_offs, mask=m_mask, other=-1e30)
+            nz = tl.load(nz_ptr + m_offs, mask=m_mask, other=-1e30)
+            sp = tl.load(nsp_ptr + m_offs, mask=m_mask, other=-1)
+
+            dx = cx[:, None] - nx[None, :]
+            dy = cy[:, None] - ny[None, :]
+            dz = cz[:, None] - nz[None, :]
+            d2 = dx * dx + dy * dy + dz * dz
+            ok = (d2 <= cutoff2) & (d2 > eps2)
+            hit = ok[:, :, None] & (sp[None, :, None] == svec[None, None, :])
+            counts += tl.sum(hit.to(tl.int32), axis=1)
+
+        tl.store(counts_ptr + c_offs[:, None] * S + svec[None, :], counts,
+                 mask=c_mask[:, None] & (svec[None, :] < S))
+
+    @triton.jit(do_not_specialize=["C", "M"])
+    def _nl_fill_kernel(
+        cx_ptr, cy_ptr, cz_ptr, nx_ptr, ny_ptr, nz_ptr, nsp_ptr, rowptr_ptr,
+        r_ptr, u_ptr,
+        C, M, cutoff2, eps2,
+        S: tl.constexpr, SP: tl.constexpr,
+        BLOCK_C: tl.constexpr, BLOCK_M: tl.constexpr,
+    ):
+        # Pass 2: recompute the same distance tests and compact-write r and the unit
+        # vector of each edge directly into its (center, species) segment, so edges
+        # come out pre-sorted for the segmented-accumulation kernel (no argsort).
+        pid = tl.program_id(0)
+        c_offs = pid * BLOCK_C + tl.arange(0, BLOCK_C)
+        c_mask = c_offs < C
+        cx = tl.load(cx_ptr + c_offs, mask=c_mask, other=1e30)
+        cy = tl.load(cy_ptr + c_offs, mask=c_mask, other=1e30)
+        cz = tl.load(cz_ptr + c_offs, mask=c_mask, other=1e30)
+
+        svec = tl.arange(0, SP)
+        base = tl.load(rowptr_ptr + c_offs[:, None] * S + svec[None, :],
+                       mask=c_mask[:, None] & (svec[None, :] < S), other=0)
+
+        for m0 in range(0, M, BLOCK_M):
+            m_offs = m0 + tl.arange(0, BLOCK_M)
+            m_mask = m_offs < M
+            nx = tl.load(nx_ptr + m_offs, mask=m_mask, other=-1e30)
+            ny = tl.load(ny_ptr + m_offs, mask=m_mask, other=-1e30)
+            nz = tl.load(nz_ptr + m_offs, mask=m_mask, other=-1e30)
+            sp = tl.load(nsp_ptr + m_offs, mask=m_mask, other=-1)
+
+            dx = nx[None, :] - cx[:, None]
+            dy = ny[None, :] - cy[:, None]
+            dz = nz[None, :] - cz[:, None]
+            d2 = dx * dx + dy * dy + dz * dz
+            ok = (d2 <= cutoff2) & (d2 > eps2)
+
+            rv = tl.sqrt(d2)
+            inv = 1.0 / tl.where(ok, rv, 1.0)
+            ux = dx * inv
+            uy = dy * inv
+            uz = dz * inv
+
+            for s in tl.static_range(S):
+                oks = ok & (sp[None, :] == s)
+                oks_i = oks.to(tl.int64)
+                excl = tl.cumsum(oks_i, axis=1) - oks_i
+                base_s = tl.sum(tl.where(svec[None, :] == s, base, 0), axis=1)
+                pos = base_s[:, None] + excl
+                tl.store(r_ptr + pos, rv, mask=oks)
+                tl.store(u_ptr + pos * 3 + 0, ux, mask=oks)
+                tl.store(u_ptr + pos * 3 + 1, uy, mask=oks)
+                tl.store(u_ptr + pos * 3 + 2, uz, mask=oks)
+
+            hit = ok[:, :, None] & (sp[None, :, None] == svec[None, None, :])
+            base += tl.sum(hit.to(tl.int64), axis=1)
+
+
+def _next_pow2(x: int) -> int:
+    return 1 << (x - 1).bit_length()
 
 
 
@@ -336,7 +572,7 @@ class SOAP:
         species: Optional[Sequence[Union[int, str]]] = None,
         periodic: bool = False,
         sparse: bool = False,
-        dtype: str = "float64",
+        dtype: str = "float32",
         device: Optional[Union[str, torch.device]] = None,
         quad_n: int = 100,
         max_num_neighbors: Optional[int] = None,
@@ -429,6 +665,20 @@ class SOAP:
         # feature slice table for optimized power spectrum filling
         self._feat_slices: Optional[List[Tuple[int,int,int,bool,int,int]]] = None
         self._build_feature_slices()
+
+        # Fused triton path (GTO, CUDA, float32, no autograd): precompute radial
+        # constants and JIT-compile/warm the kernels now so create() is not charged
+        # for one-time compilation.
+        self._use_fused = False
+        self._use_fused_nl = False
+        if (
+            _HAS_TRITON
+            and self._rbf == "gto"
+            and self.dtype == torch.float32
+            and str(self.device).startswith("cuda")
+            and torch.cuda.is_available()
+        ):
+            self._init_fused_gto()
 
 
     # ---- sphericart ----
@@ -704,68 +954,73 @@ class SOAP:
         """
         centers = centers.detach()
         neigh_pos = neigh_pos.detach()
-        try:
-            from torch_cluster import radius
-            self._last_nl_backend = "torch_cluster"
-            row, col = radius(
-                x=neigh_pos,
-                y=centers,
-                r=cutoff,
-                batch_x=batch_neigh,
-                batch_y=batch_centers,
-                max_num_neighbors=self.max_num_neighbors,
+        if self.max_num_neighbors is not None:
+            # torch_cluster truncates at max_num_neighbors, so only use it when the
+            # caller explicitly opted in. (Its default of None is not a valid arg.)
+            try:
+                from torch_cluster import radius
+                self._last_nl_backend = "torch_cluster"
+                row, col = radius(
+                    x=neigh_pos,
+                    y=centers,
+                    r=cutoff,
+                    batch_x=batch_neigh,
+                    batch_y=batch_centers,
+                    max_num_neighbors=self.max_num_neighbors,
+                )
+                return col, row
+            except Exception:
+                pass
+        self._last_nl_backend = "gemm"
+        C = int(centers.shape[0])
+        M = int(neigh_pos.shape[0])
+        if C == 0 or M == 0:
+            return (
+                torch.empty((0,), device=centers.device, dtype=torch.long),
+                torch.empty((0,), device=centers.device, dtype=torch.long),
             )
-            return col, row
-        except Exception:
-            self._last_nl_backend = "gemm"
-            C = int(centers.shape[0])
-            M = int(neigh_pos.shape[0])
-            if C == 0 or M == 0:
-                return (
-                    torch.empty((0,), device=centers.device, dtype=torch.long),
-                    torch.empty((0,), device=centers.device, dtype=torch.long),
-                )
 
-            device = centers.device
-            dtype = centers.dtype
-            chunk = 1024
-            cutoff2 = float(cutoff) * float(cutoff)
+        device = centers.device
+        dtype = centers.dtype
+        # Bigger chunks = fewer host syncs from nonzero(); cap the scratch buffer
+        # at ~1GB for float32.
+        chunk = max(1024, min(C, int((2 ** 28) // max(M, 1))))
+        cutoff2 = float(cutoff) * float(cutoff)
 
-            neigh_T = neigh_pos.transpose(0, 1).contiguous()          # (3,M)
-            neigh_norm = (neigh_pos * neigh_pos).sum(dim=1)           # (M,)
+        neigh_T = neigh_pos.transpose(0, 1).contiguous()          # (3,M)
+        neigh_norm = (neigh_pos * neigh_pos).sum(dim=1)           # (M,)
 
-            center_list: List[torch.Tensor] = []
-            neigh_list: List[torch.Tensor] = []
+        center_list: List[torch.Tensor] = []
+        neigh_list: List[torch.Tensor] = []
 
-            for s in range(0, C, chunk):
-                e = min(s + chunk, C)
-                cpos = centers[s:e]                                   # (c,3)
-                c = int(cpos.shape[0])
+        for s in range(0, C, chunk):
+            e = min(s + chunk, C)
+            cpos = centers[s:e]                                   # (c,3)
+            c = int(cpos.shape[0])
 
-                c_norm = (cpos * cpos).sum(dim=1)                     # (c,)
+            c_norm = (cpos * cpos).sum(dim=1)                     # (c,)
 
-                buf = self._get_scratch("nl_prod", (c, M), device=device, dtype=dtype)
-                prod = buf[:c, :M]
-                torch.mm(cpos, neigh_T, out=prod)
+            buf = self._get_scratch("nl_prod", (c, M), device=device, dtype=dtype)
+            prod = buf[:c, :M]
+            torch.mm(cpos, neigh_T, out=prod)
 
-                dist2 = prod
-                dist2.mul_(-2.0)
-                dist2.add_(c_norm[:, None])
-                dist2.add_(neigh_norm[None, :])
+            dist2 = prod
+            dist2.mul_(-2.0)
+            dist2.add_(c_norm[:, None])
+            dist2.add_(neigh_norm[None, :])
 
-                mask = dist2 <= cutoff2
-                if mask.any():
-                    idx = torch.nonzero(mask, as_tuple=False)
-                    center_list.append(idx[:, 0] + s)
-                    neigh_list.append(idx[:, 1])
+            idx = torch.nonzero(dist2 <= cutoff2, as_tuple=False)
+            if idx.numel() > 0:
+                center_list.append(idx[:, 0] + s)
+                neigh_list.append(idx[:, 1])
 
-            if len(center_list) == 0:
-                return (
-                    torch.empty((0,), device=device, dtype=torch.long),
-                    torch.empty((0,), device=device, dtype=torch.long),
-                )
+        if len(center_list) == 0:
+            return (
+                torch.empty((0,), device=device, dtype=torch.long),
+                torch.empty((0,), device=device, dtype=torch.long),
+            )
 
-            return torch.cat(center_list, dim=0), torch.cat(neigh_list, dim=0)
+        return torch.cat(center_list, dim=0), torch.cat(neigh_list, dim=0)
 
 
     def _build_neighbor_list(
@@ -906,6 +1161,15 @@ class SOAP:
         device = r.device
         dtype = r.dtype
 
+        # Fast path: fused triton kernel (no autograd requirement, float32, CUDA).
+        if (
+            self._use_fused
+            and dtype == torch.float32
+            and r.is_cuda
+            and not (rvec.requires_grad or r.requires_grad)
+        ):
+            return self._coefficients_gto_fused(center_index, neigh_species, rvec, r, n_centers, prof=prof)
+
         # sphericart.torch.SphericalHarmonics uses the direction of xyz; xyz==0 is undefined.
 
         # Build unit vectors and guard any tiny radii (should mostly be removed in _build_neighbor_list).
@@ -988,6 +1252,318 @@ class SOAP:
                 c = torch.einsum("ab,csbm->csam", beta_l, acc)
             out.append(c)
 
+        return out
+
+    # ---- fused triton path (GTO / CUDA / float32) ----
+
+    def _init_fused_gto(self) -> None:
+        """Precompute per-l radial constants for the fused kernel and warm it up."""
+        dtype64 = torch.float64
+        eta = torch.tensor(self._eta, device=self.device, dtype=dtype64)
+        alphas = self._alphas.to(dtype=dtype64)                      # (Lp1, n_max)
+        p = alphas + eta
+        l_col = torch.arange(self._l_max + 1, device=self.device, dtype=dtype64)[:, None]
+        G = alphas * eta / p                                          # (Lp1, n_max)
+        PREF = (math.pi ** 1.5) * (eta / p) ** l_col * p ** (-1.5)    # (Lp1, n_max)
+        self._fused_G = G.to(dtype=torch.float32).contiguous()
+        self._fused_PREF = PREF.to(dtype=torch.float32).contiguous()
+
+        # Normalization table N_lm for the inline Ylm kernel (sphericart convention).
+        nrm = torch.zeros((self._l_max + 1, self._l_max + 1), dtype=torch.float64)
+        for l in range(self._l_max + 1):
+            for m in range(l + 1):
+                n = math.sqrt(
+                    (2 * l + 1) / (4.0 * math.pi)
+                    * math.factorial(l - m) / math.factorial(l + m)
+                )
+                if m > 0:
+                    n *= math.sqrt(2.0)
+                nrm[l, m] = n
+        self._ylm_nrm = nrm.to(device=self.device, dtype=torch.float32).contiguous()
+        # The unrolled recurrences and fp32 double factorials are fine up to l~9
+        # (DScribe caps l_max at 9 as well); beyond that use sphericart + transpose.
+        self._ylm_inline = self._l_max <= 9
+
+        _ensure_triton_ptxas()
+        try:
+            # Tiny synthetic problem: compiles all (l)-specializations of the kernels.
+            E, n_rows = 8, 4
+            r = torch.rand(E, device=self.device, dtype=torch.float32) + 0.5
+            rowptr = torch.tensor([0, 2, 4, 6, E], device=self.device, dtype=torch.long)
+            v = torch.randn(E, 3, device=self.device, dtype=torch.float32)
+            u = (v / v.norm(dim=1, keepdim=True)).contiguous()
+            Yt = self._launch_ylm(u)
+            for has_w in (False, True) if self._weighting is not None else (False,):
+                w = r.clone() if has_w else None
+                self._launch_fused_acc(r, w, Yt, rowptr, n_rows)
+            torch.cuda.synchronize()
+            self._use_fused = True
+        except Exception:
+            self._use_fused = False
+            return
+
+        # Warm/compile the fused neighbor-list kernels on a tiny synthetic system.
+        try:
+            pos = torch.rand(6, 3, device=self.device, dtype=torch.float32) * 2.0
+            spv = torch.arange(6, device=self.device, dtype=torch.int32) % self.n_species
+            self._neighbor_fused(pos[:3], pos, spv)
+            torch.cuda.synchronize()
+            self._use_fused_nl = True
+        except Exception:
+            self._use_fused_nl = False
+
+        # Pre-grow the CUDA caching-allocator pool: the first large allocation
+        # (e.g. the harmonics buffer for a big system) otherwise pays a slow
+        # cudaMalloc inside the first create() call.
+        try:
+            free_b, _ = torch.cuda.mem_get_info(self.device)
+            n = int(min(free_b * 0.5, float(12 << 30)))
+            if n > 0:
+                buf = torch.empty((n,), dtype=torch.uint8, device=self.device)
+                del buf
+        except Exception:
+            pass
+
+        # Warm the remaining pipeline (sphericart CUDA, cuBLAS/einsum, sort,
+        # searchsorted) so the first timed create() runs at steady state.
+        try:
+            with torch.no_grad():
+                z0 = int(self._atomic_numbers[0].item())
+                dummy = {
+                    "positions": torch.tensor(
+                        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], device=self.device, dtype=self.dtype
+                    ),
+                    "atomic_numbers": torch.tensor([z0, z0], device=self.device, dtype=torch.long),
+                }
+                if self.periodic:
+                    dummy["cell"] = torch.eye(3, device=self.device, dtype=self.dtype) * (4.0 * self._cutoff)
+                    dummy["pbc"] = torch.tensor([True, True, True], device=self.device)
+                self.create(dummy)
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+    def _neighbor_fused(
+        self,
+        centers_xyz: torch.Tensor,     # (C,3) float32
+        neigh_pos: torch.Tensor,       # (M,3) float32 (species-filtered, possibly PBC-extended)
+        neigh_sp: torch.Tensor,        # (M,) int32 species index in [0, n_species)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Two-pass brute-force neighbor search on GPU.
+
+        Returns (rowptr, r, unit) where edges are compacted into contiguous
+        (center, species) segments: rowptr has n_centers*n_species+1 entries and
+        r/unit hold the edge distance and unit vector (center -> neighbor).
+        Self edges (r ~ 0) are excluded, as in _build_neighbor_list.
+        """
+        device = centers_xyz.device
+        C = int(centers_xyz.shape[0])
+        M = int(neigh_pos.shape[0])
+        S = self.n_species
+        n_rows = C * S
+        if C == 0 or M == 0:
+            return (
+                torch.zeros((n_rows + 1,), device=device, dtype=torch.long),
+                torch.empty((0,), device=device, dtype=torch.float32),
+                torch.empty((0, 3), device=device, dtype=torch.float32),
+            )
+
+        # Separate contiguous coordinate arrays: coalesced loads in the kernels and
+        # a stable 16B-alignment specialization key regardless of C/M parity.
+        cen = centers_xyz.detach()
+        nei = neigh_pos.detach()
+        cxs = [cen[:, k].contiguous() for k in range(3)]
+        nxs = [nei[:, k].contiguous() for k in range(3)]
+        nsp = neigh_sp.contiguous()
+        cutoff2 = float(self._cutoff) ** 2
+        eps_self = 1e-8
+        eps2 = eps_self * eps_self
+        SP = _next_pow2(S)
+        BLOCK_C, BLOCK_M = 32, 64
+        grid = (triton.cdiv(C, BLOCK_C),)
+        args = (cxs[0], cxs[1], cxs[2], nxs[0], nxs[1], nxs[2], nsp)
+
+        counts = torch.empty((n_rows,), device=device, dtype=torch.int32)
+        _nl_count_kernel[grid](*args, counts, C, M, cutoff2, eps2,
+                               S=S, SP=SP, BLOCK_C=BLOCK_C, BLOCK_M=BLOCK_M, num_warps=4)
+        rowptr = torch.zeros((n_rows + 1,), device=device, dtype=torch.long)
+        rowptr[1:] = torch.cumsum(counts.to(torch.long), dim=0)
+        E = int(rowptr[-1].item())
+        self._last_nl_backend = "triton"
+        self._last_E = E
+
+        r = torch.empty((E,), device=device, dtype=torch.float32)
+        u = torch.empty((E, 3), device=device, dtype=torch.float32)
+        if E > 0:
+            _nl_fill_kernel[grid](*args, rowptr, r, u, C, M, cutoff2, eps2,
+                                  S=S, SP=SP, BLOCK_C=BLOCK_C, BLOCK_M=BLOCK_M, num_warps=4)
+        return rowptr, r, u
+
+    def _fused_pipeline_ok(self, positions: torch.Tensor, centers_xyz: torch.Tensor) -> bool:
+        return (
+            self._use_fused
+            and self._use_fused_nl
+            and self._rbf == "gto"
+            and positions.is_cuda
+            and positions.dtype == torch.float32
+            and not positions.requires_grad
+            and not centers_xyz.requires_grad
+        )
+
+    def _features_fused(
+        self,
+        positions: torch.Tensor,
+        Z: torch.Tensor,
+        centers_xyz: torch.Tensor,
+        cell: Optional[torch.Tensor],
+        pbc: Optional[torch.Tensor],
+        prof: Optional[Profiler] = None,
+    ) -> List[torch.Tensor]:
+        """Fully fused pipeline: neighbor search -> Ylm -> density accumulation -> beta.
+        Returns coeffs list over l of (C, S, n_max, 2l+1), same as _coefficients_gto."""
+        from contextlib import nullcontext
+
+        def _sec(name):
+            return prof.section(name) if prof is not None else nullcontext()
+
+        n_centers = int(centers_xyz.shape[0])
+        n_rows = n_centers * self.n_species
+        LM_TOT = (self._l_max + 1) ** 2
+
+        with _sec("neighbor"):
+            if self.periodic:
+                if cell is None or pbc is None:
+                    raise ValueError("periodic=True requires cell and pbc.")
+                neigh_pos, neigh_Z = self._extend_periodic(positions, Z, cell, pbc)
+            else:
+                neigh_pos, neigh_Z = positions, Z
+
+            neigh_species_all = self._map_Z_to_species(neigh_Z)
+            keep = neigh_species_all >= 0
+            if not bool(keep.all()):
+                neigh_pos = neigh_pos[keep]
+                neigh_species_all = neigh_species_all[keep]
+
+            rowptr, r_s, unit_s = self._neighbor_fused(
+                centers_xyz, neigh_pos, neigh_species_all.to(torch.int32)
+            )
+
+        if r_s.numel() == 0:
+            acc = torch.zeros((n_rows, self._n_max, LM_TOT), device=positions.device, dtype=torch.float32)
+        else:
+            with _sec("ylm"):
+                Yt = self._launch_ylm(unit_s)
+            with _sec("weights"):
+                w_s = self._weighting(r_s).contiguous() if self._weighting is not None else None
+            with _sec("scatter"):
+                acc = self._launch_fused_acc(r_s, w_s, Yt, rowptr, n_rows)
+
+        acc = acc.view(n_centers, self.n_species, self._n_max, LM_TOT)
+        const = self._get_const(positions.device, torch.float32)
+        betas = const["betas"]
+        with _sec("beta"):
+            out = []
+            for l in range(self._l_max + 1):
+                acc_l = acc[:, :, :, l * l:(l + 1) * (l + 1)]
+                out.append(torch.einsum("ab,csbm->csam", betas[l], acc_l))
+        return out
+
+    def _launch_ylm(self, unit: torch.Tensor) -> torch.Tensor:
+        """Real spherical harmonics for unit vectors (E,3), returned TRANSPOSED:
+        ((l_max+1)^2, E) float32, matching what _launch_fused_acc expects."""
+        E = int(unit.shape[0])
+        LM_TOT = (self._l_max + 1) ** 2
+        if self._ylm_inline:
+            Yt = torch.empty((LM_TOT, E), device=unit.device, dtype=torch.float32)
+            if E > 0:
+                BLOCK_E = 128
+                _ylm_all_kernel[(triton.cdiv(E, BLOCK_E),)](
+                    unit.contiguous(), self._ylm_nrm, Yt, E,
+                    LMAX=self._l_max, BLOCK_E=BLOCK_E,
+                )
+            return Yt
+        Y = self._Y.compute(unit)
+        if Y.dtype != torch.float32:
+            Y = Y.to(torch.float32)
+        return Y.t().contiguous()
+
+    def _launch_fused_acc(
+        self,
+        r: torch.Tensor,               # (E,) float32, edges sorted by row
+        w: Optional[torch.Tensor],     # (E,) float32 or None
+        Yt: torch.Tensor,              # ((l_max+1)^2, E) float32, transposed harmonics
+        rowptr: torch.Tensor,          # (n_rows+1,) long, CSR segment offsets
+        n_rows: int,
+    ) -> torch.Tensor:
+        """Returns acc (n_rows, n_max, (l_max+1)^2): primitive density coefficients."""
+        E = int(r.shape[0])
+        LM_TOT = (self._l_max + 1) ** 2
+        acc = torch.empty((n_rows, self._n_max, LM_TOT), device=r.device, dtype=torch.float32)
+        has_w = w is not None
+        wp = w if has_w else r  # dummy pointer, kernel never reads it when HAS_W=False
+        for l in range(self._l_max + 1):
+            ML = 2 * l + 1
+            _soap_gto_acc_kernel[(n_rows,)](
+                r, wp, Yt, rowptr,
+                self._fused_G[l], self._fused_PREF[l],
+                acc, E,
+                L=l, ML=ML, MLP=_next_pow2(ML),
+                NMAX=self._n_max, NMAXP=_next_pow2(self._n_max),
+                LM_TOT=LM_TOT, LM0=l * l,
+                BLOCK_E=32, HAS_W=has_w,
+                num_warps=4,
+            )
+        return acc
+
+    def _coefficients_gto_fused(
+        self,
+        center_index: torch.Tensor,
+        neigh_species: torch.Tensor,
+        rvec: torch.Tensor,
+        r: torch.Tensor,
+        n_centers: int,
+        prof: Optional[Profiler] = None,
+    ) -> List[torch.Tensor]:
+        """Fused-kernel equivalent of _coefficients_gto. Same output: list over l of
+        (C, S, n_max, 2l+1)."""
+        device = r.device
+        n_rows = n_centers * self.n_species
+        LM_TOT = (self._l_max + 1) ** 2
+        const = self._get_const(device, torch.float32)
+        betas = const["betas"]
+
+        from contextlib import nullcontext
+
+        def _sections(name):
+            return prof.section(name) if prof is not None else nullcontext()
+
+        if center_index.numel() == 0:
+            acc = torch.zeros((n_rows, self._n_max, LM_TOT), device=device, dtype=torch.float32)
+        else:
+            with _sections("sort"):
+                idx0 = center_index * self.n_species + neigh_species
+                order = torch.argsort(idx0)
+                idx0 = idx0[order]
+                r_s = r[order].contiguous()
+                rvec_s = rvec[order]
+                rowptr = torch.searchsorted(
+                    idx0, torch.arange(n_rows + 1, device=device, dtype=idx0.dtype)
+                )
+            with _sections("ylm"):
+                unit = (rvec_s / r_s[:, None]).contiguous()
+                Yt = self._launch_ylm(unit)
+            with _sections("weights"):
+                w_s = self._weighting(r_s).contiguous() if self._weighting is not None else None
+            with _sections("scatter"):
+                acc = self._launch_fused_acc(r_s, w_s, Yt, rowptr, n_rows)
+
+        acc = acc.view(n_centers, self.n_species, self._n_max, LM_TOT)
+        with _sections("beta"):
+            out = []
+            for l in range(self._l_max + 1):
+                acc_l = acc[:, :, :, l * l:(l + 1) * (l + 1)]
+                c = torch.einsum("ab,csbm->csam", betas[l], acc_l)
+                out.append(c)
         return out
 
     def _coefficients_polynomial(
@@ -1160,16 +1736,19 @@ class SOAP:
 
         centers_xyz, center_indices = self.prepare_centers(positions, centers)
 
-        center_index, neigh_species, rvec, r = self._build_neighbor_list(
-            positions, Z, centers_xyz, cell, pbc
-        )
-
         n_centers = int(centers_xyz.shape[0])
 
-        if self._rbf == "gto":
-            coeffs = self._coefficients_gto(center_index, neigh_species, rvec, r, n_centers)
+        if self._fused_pipeline_ok(positions, centers_xyz):
+            coeffs = self._features_fused(positions, Z, centers_xyz, cell, pbc)
         else:
-            coeffs = self._coefficients_polynomial(center_index, neigh_species, rvec, r, n_centers)
+            center_index, neigh_species, rvec, r = self._build_neighbor_list(
+                positions, Z, centers_xyz, cell, pbc
+            )
+
+            if self._rbf == "gto":
+                coeffs = self._coefficients_gto(center_index, neigh_species, rvec, r, n_centers)
+            else:
+                coeffs = self._coefficients_polynomial(center_index, neigh_species, rvec, r, n_centers)
 
 
         # Add analytic self-contribution for centers that coincide with an atom position.
@@ -1209,17 +1788,22 @@ class SOAP:
             with prof.section("centers"):
                 centers_xyz, center_indices = self.prepare_centers(positions, centers)
 
-            with prof.section("neighbor"):
-                center_index, neigh_species, rvec, r = self._build_neighbor_list(
-                    positions, Z, centers_xyz, cell, pbc
-                )
-
             n_centers = int(centers_xyz.shape[0])
 
-            if self._rbf == "gto":
-                coeffs = self._coefficients_gto(center_index, neigh_species, rvec, r, n_centers, prof=prof)
+            if self._fused_pipeline_ok(positions, centers_xyz):
+                coeffs = self._features_fused(positions, Z, centers_xyz, cell, pbc, prof=prof)
+                n_edges = int(getattr(self, "_last_E", 0))
             else:
-                coeffs = self._coefficients_polynomial(center_index, neigh_species, rvec, r, n_centers, prof=prof)
+                with prof.section("neighbor"):
+                    center_index, neigh_species, rvec, r = self._build_neighbor_list(
+                        positions, Z, centers_xyz, cell, pbc
+                    )
+
+                if self._rbf == "gto":
+                    coeffs = self._coefficients_gto(center_index, neigh_species, rvec, r, n_centers, prof=prof)
+                else:
+                    coeffs = self._coefficients_polynomial(center_index, neigh_species, rvec, r, n_centers, prof=prof)
+                n_edges = int(center_index.numel())
 
             with prof.section("self_terms"):
                 self._add_self_terms(coeffs, center_indices, Z)
@@ -1233,8 +1817,8 @@ class SOAP:
         extra = {
             "n_atoms": int(positions.shape[0]),
             "n_centers": int(n_centers),
-            "E_edges": int(center_index.numel()),
-            "neighbors_per_center": (float(center_index.numel()) / float(n_centers)) if n_centers > 0 else 0.0,
+            "E_edges": n_edges,
+            "neighbors_per_center": (float(n_edges) / float(n_centers)) if n_centers > 0 else 0.0,
             "nl_backend": getattr(self, "_last_nl_backend", "unknown"),
         }
         return (out.to_sparse_coo() if self.sparse else out), prof.times, extra
