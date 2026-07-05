@@ -2085,11 +2085,13 @@ class SOAP:
             full[:, :, :, start:end] = c_l 
         return full.reshape(C, -1)
 
-    def _power_spectrum(self, coeffs: List[torch.Tensor]) -> torch.Tensor:
+    def _power_spectrum(self, coeffs: List[torch.Tensor], per_center: bool = False) -> torch.Tensor:
         """
         Optimized power spectrum:
         - For each l, compute all species-pair correlations with a single einsum
         - Fill the descriptor using precomputed feature slices (DScribe ordering)
+        - per_center=True skips the final center average for average='outer',
+          returning the per-atom (n_centers, n_features) descriptor instead
 
         Ordering matches DScribe loops:
           for j in species:
@@ -2132,7 +2134,8 @@ class SOAP:
                     desc[:, start:end] = P_all[:, j, jd, :, :].reshape(C_use, -1)
 
         if self.average == "outer":
-            desc = desc.mean(dim=0)
+            if not per_center:
+                desc = desc.mean(dim=0)
         elif self.average == "inner":
             desc = desc.squeeze(0)
 
@@ -2202,7 +2205,9 @@ class SOAP:
         if self.average == "cc":
             out = self._projection_cc(coeffs)  # (C, n_cc)
         else:
-            out = self._power_spectrum(coeffs) # (C,feat) or (feat,)
+            # average='outer' returns the per-atom power spectrum (C, feat)
+            # instead of the center-averaged (feat,) descriptor
+            out = self._power_spectrum(coeffs, per_center=(self.average == "outer"))
         return out.to_sparse_coo() if self.sparse else out
 
     # ---- Public: derivatives (DScribe-like numerical) ----
@@ -2257,7 +2262,7 @@ class SOAP:
                 if self.average == "cc":
                     out = self._projection_cc(coeffs)
                 else:
-                    out = self._power_spectrum(coeffs)
+                    out = self._power_spectrum(coeffs, per_center=(self.average == "outer"))
 
         extra = {
             "n_atoms": int(positions.shape[0]),
