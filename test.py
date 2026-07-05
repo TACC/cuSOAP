@@ -53,23 +53,25 @@ molecules = read(xyzfilename,format='xyz',index=":")
 start_time = time.perf_counter()
 for i, molecule in enumerate(molecules):
  # construct SOAP tensors
- pytorch_soap_tensor = pytorch_soap.create(molecule)
+ pytorch_soap_vectors_batched = []
  # construct SOAP derivative tensors
- pytorch_soap_derivatives_batched = []
+ #pytorch_soap_derivatives_batched = []
  num_atoms = len(molecule)
  if not is_batched:
      centers_batchsize = num_atoms
- num_batches = math.ceil(num_atoms / centers_batchsize) 
+ num_batches = math.ceil(num_atoms / centers_batchsize)
  for ibatch in range(num_batches):
      sindex = ibatch * centers_batchsize
      eindex = min(sindex + centers_batchsize, num_atoms)
-     pytorch_soap_derivatives_batched.append(pytorch_soap.derivatives(system=molecule, centers=list(range(sindex, eindex)), method="analytical", return_descriptor=False))
+     pytorch_soap_vectors_batched.append(pytorch_soap.create(molecule, centers=list(range(sindex,eindex))))
+     #pytorch_soap_derivatives_batched.append(pytorch_soap.derivatives(system=molecule, centers=list(range(sindex, eindex)), method="analytical", return_descriptor=False))
 
-# convert the SOAP derivatives list to a Pytorch tensor
-pytorch_soap_derivatives = torch.cat(pytorch_soap_derivatives_batched, dim=0)
+# convert the SOAP tensor list to a Pytorch tensor
+pytorch_soap_vectors = torch.cat(pytorch_soap_vectors_batched, dim=0)
+# convert the SOAP derivative tensor list to a Pytorch tensor
+#pytorch_soap_derivatives = torch.cat(pytorch_soap_derivatives_batched, dim=0)
 end_time = time.perf_counter()
 duration_pytorch = end_time - start_time
 print(f"PYTORCH_SOAP Execution time: {duration_pytorch:.4f} seconds")
-
 
 
