@@ -6,7 +6,9 @@ Overview
 --------
 - Match the *functionality* and *feature ordering* of the DScribe SOAP
   (SOAP( r_cut, n_max, l_max, sigma, rbf, weighting, crossover, average, species, periodic, sparse, dtype )).
-- Provide *numerical derivatives* (finite differences) with the same output shape conventions as DScribe.
+- Provide analytical (closed-form / autograd) and numerical derivatives with output shape
+  (n_centers, 3, n_atoms_included, n_features); center-batches concatenate along dim 0 into
+  the full (n_atoms, 3, n_atoms, n_features) Jacobian.
 - Run on **GPU end-to-end** for the heavy parts: spherical harmonics, radial basis evaluation, accumulation, power spectrum.
   (Neighbor list can use torch_cluster on GPU when installed; otherwise a chunked torch.cdist fallback is used.)
 --------
@@ -26,6 +28,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import math
 import os
 import time
+import weakref
+import numpy as np
 import torch
 
 # -----------------------------
@@ -53,6 +57,88 @@ def _ensure_triton_ptxas() -> None:
         if os.path.exists(cand):
             os.environ["TRITON_PTXAS_PATH"] = cand
             return
+
+
+# -----------------------------
+# Zero-copy torch.cat fast path for batched derivative outputs
+# -----------------------------
+# SOAP.derivatives with persistent_output_buffer=True returns each center-batch
+# Jacobian as a dim-0 slice (view) of one persistent (N, 3, N, F) buffer. The
+# canonical way users stitch those batches back together is
+# torch.cat(batches, dim=0) -- which for consecutive slices of one buffer would
+# allocate and copy a second multi-GB (N, 3, N, F) tensor bit-identical to
+# the buffer region the inputs already occupy. This wrapper detects exactly
+# that case (every input is a contiguous, consecutive dim-0 slice of a buffer
+# registered by this module) and returns a zero-copy view instead. Every other
+# torch.cat call falls through to the original, unchanged. The returned view
+# aliases the SOAP object's buffer, so it is overwritten by later derivatives()
+# calls on the same object -- the same lifetime rule the input slices already
+# have.
+_OUT_BUFFERS: Dict[int, "weakref.ref[torch.Tensor]"] = {}  # storage data_ptr -> buffer
+_torch_cat_orig = torch.cat
+
+
+def _register_out_buffer(buf: torch.Tensor) -> None:
+    _OUT_BUFFERS[buf.untyped_storage().data_ptr()] = weakref.ref(buf)
+
+
+def _is_registered_out_storage(ptr: int) -> bool:
+    ref = _OUT_BUFFERS.get(ptr)
+    if ref is None:
+        return False
+    buf = ref()
+    if buf is None or buf.untyped_storage().data_ptr() != ptr:
+        # buffer died (or its storage moved); drop the stale entry
+        _OUT_BUFFERS.pop(ptr, None)
+        return False
+    return True
+
+
+def _cat_view_fastpath(tensors, dim=0, *, out=None):
+    try:
+        if out is None and dim == 0 and isinstance(tensors, (list, tuple)) and len(tensors) > 0:
+            base = tensors[0]
+            if (
+                isinstance(base, torch.Tensor)
+                and base.dim() > 0
+                and not any(t.requires_grad for t in tensors)
+            ):
+                st = base.untyped_storage().data_ptr()
+                if _is_registered_out_storage(st):
+                    esz = base.element_size()
+                    tail = base.shape[1:]
+                    expect = base.data_ptr()
+                    n0 = 0
+                    for t in tensors:
+                        if (
+                            not isinstance(t, torch.Tensor)
+                            or t.shape[1:] != tail
+                            or t.dtype != base.dtype
+                            or t.device != base.device
+                            or not t.is_contiguous()
+                            or t.untyped_storage().data_ptr() != st
+                            or t.data_ptr() != expect
+                        ):
+                            break
+                        expect += t.numel() * esz
+                        n0 += int(t.shape[0])
+                    else:
+                        res = base.new_empty(0)
+                        res.set_(
+                            base.untyped_storage(),
+                            base.storage_offset(),
+                            (n0, *tail),
+                            base.stride(),
+                        )
+                        return res
+    except Exception:
+        pass
+    if out is None:
+        return _torch_cat_orig(tensors, dim=dim)
+    return _torch_cat_orig(tensors, dim=dim, out=out)
+
+
+torch.cat = _cat_view_fastpath
 
 
 if _HAS_TRITON:
@@ -163,6 +249,228 @@ if _HAS_TRITON:
             A = A_new
             B = B_new
             dfact = dfact * (2.0 * m + 1.0)
+
+    @triton.jit(do_not_specialize=["E", "A", "FA"])
+    def _soap_grad_scatter_kernel(
+        rvec_ptr,                 # (E,3) float32
+        b_ptr, bh_ptr,            # (E, NMAX, LP1) radial factors B / Bhat
+        yv_ptr, yg_ptr,           # (E, LMTOT) Y and (E, 3, LMTOT) dY/dr
+        lof_ptr,                  # (LMTOT,) int32: lm -> l
+        rown_ptr, rowc_ptr,       # (E,) int64 base offsets (neighbor target / center acc)
+        out_ptr,                  # (n_centers, 3, n_inc, S*NMAX*LMTOT) Jacobian buffer
+        acc_ptr,                  # (n_centers*S, NMAX*LMTOT, 3) center-term accumulator
+        E, A, FA,                 # A = (n,lm) element stride, FA = S*NMAX*LMTOT*n_inc (d stride)
+        NMAX: tl.constexpr, LP1: tl.constexpr, LMTOT: tl.constexpr,
+        INP: tl.constexpr,        # next_pow2(NMAX*LMTOT), flattened (n,lm) tile
+        WRITE_OUT: tl.constexpr,  # 0: only accumulate the center term into acc
+    ):
+        # One program per edge. Computes the edge gradient
+        #   g[n,lm,d] = rvec[d] * Bhat[n,l(lm)] * Y[lm] + B[n,l(lm)] * dY[d,lm]
+        # entirely in registers and stores +g straight into the neighbor's row
+        # of the output Jacobian, which is laid out atom-major as
+        # (center, 3, atom, species*n*lm): element (c,d,a,sp,n,lm) lives at
+        # ((c*3+d)*n_inc + a)*S*NMAX*LMTOT + sp*NMAX*LMTOT + n*LMTOT+lm. rown
+        # holds the host-computed base (c*3*n_inc + a)*S*NMAX*LMTOT +
+        # sp*NMAX*LMTOT (targets are unique per edge: one (center, atom) pair
+        # each, and self-edges are excluded, so plain stores suffice). The
+        # tile is (n*lm, d); output stores step A (=1 for the atom-major
+        # layout) per (n,lm) and FA per component, the accumulator keeps d
+        # innermost. The center term is atomically accumulated into a small
+        # compact per-center buffer that the host later subtracts at the
+        # center-atom rows. The (E,3,NMAX,LMTOT) tensor g is never
+        # materialized.
+        e = tl.program_id(0)
+        i_offs = tl.arange(0, INP)                 # flattened (n, lm)
+        i_mask = i_offs < NMAX * LMTOT
+        n_i = i_offs // LMTOT
+        lm_i = i_offs - n_i * LMTOT
+        d_offs = tl.arange(0, 4)
+        d_mask = d_offs < 3
+        mask2 = i_mask[:, None] & d_mask[None, :]
+
+        lidx = tl.load(lof_ptr + lm_i, mask=i_mask, other=0)
+        bbase = e.to(tl.int64) * (NMAX * LP1)
+        b_ptrs = n_i * LP1 + lidx
+        Bv = tl.load(b_ptr + bbase + b_ptrs, mask=i_mask, other=0.0)
+        Bh = tl.load(bh_ptr + bbase + b_ptrs, mask=i_mask, other=0.0)
+        Yv = tl.load(yv_ptr + e.to(tl.int64) * LMTOT + lm_i, mask=i_mask, other=0.0)
+        BhY = Bh * Yv
+
+        rv = tl.load(rvec_ptr + e.to(tl.int64) * 3 + d_offs, mask=d_mask, other=0.0)
+        Yg = tl.load(
+            yg_ptr + e.to(tl.int64) * (3 * LMTOT) + d_offs[None, :] * LMTOT + lm_i[:, None],
+            mask=mask2, other=0.0,
+        )
+        g = rv[None, :] * BhY[:, None] + Bv[:, None] * Yg  # (INP, 4)
+
+        row_c = tl.load(rowc_ptr + e)  # int64 element offset of (c*S+sp, 0, 0)
+        if WRITE_OUT:
+            row_n = tl.load(rown_ptr + e)  # int64 element offset of (c, 0, sp, 0, 0, a)
+            tl.store(out_ptr + row_n + i_offs.to(tl.int64)[:, None] * A
+                     + d_offs.to(tl.int64)[None, :] * FA,
+                     g, mask=mask2)
+        tl.atomic_add(acc_ptr + row_c + i_offs[:, None] * 3 + d_offs[None, :],
+                      g, mask=mask2)
+
+    @triton.jit(do_not_specialize=["A"])
+    def _soap_grad_stream_kernel(
+        eid_ptr,                  # (C, A) int32: edge id of (center, atom) or -1
+        nsp_ptr,                  # (E,) int32 neighbor species per edge
+        rvec_ptr,                 # (E,3) float32
+        b_ptr, bh_ptr,            # (E, NMAX, LP1) radial factors B / Bhat
+        yv_ptr, yg_ptr,           # (E, LMTOT) Y and (E, 3, LMTOT) dY/dr
+        lof_ptr,                  # (LMTOT,) int32: lm -> l
+        cidx_ptr,                 # (C,) int32: atom index of each center
+        rowptr_ptr,               # (C+1,) int32: edge range per center (edges center-sorted)
+        out_ptr,                  # (C, 3, A, S*NMAX*LMTOT) Jacobian buffer, or
+                                  # (3, A, S, NMAX, C, LMTOT) when TRANSPOSED
+        A,                        # number of atoms on the output axis (n_inc)
+        C,                        # number of centers (used when TRANSPOSED)
+        NMAX: tl.constexpr, LP1: tl.constexpr, LMTOT: tl.constexpr,
+        S: tl.constexpr,
+        INP: tl.constexpr,        # next_pow2(NMAX*LMTOT), flattened (n,lm) tile
+        TRANSPOSED: tl.constexpr = 0,  # write the GEMM-ready layout directly
+    ):
+        # Streaming writer that replaces zero-fill + scattered stores for the
+        # atom-major layout (C, 3, A, F) with F = (sp, n, lm): one program per
+        # (center, atom) pair, writing the three contiguous F-element feature
+        # rows out[c, 0:3, a, :] exactly once. When (c, a) is an edge, the
+        # edge gradient
+        #   g[n,lm,d] = rvec[d] * Bhat[n,l(lm)] * Y[lm] + B[n,l(lm)] * dY[d,lm]
+        # is computed in registers and stored into the neighbor-species
+        # feature block; every other feature entry (and the whole row for
+        # non-neighbor pairs) is written as 0.0 through the same stores, since
+        # the masked edge-data loads already yield g == 0 there. The one row
+        # per center whose atom column IS the center (a self-edge never
+        # exists) is skipped here and written by _soap_grad_center_kernel,
+        # which runs concurrently on a side stream; together the two kernels
+        # write every byte of the multi-GB Jacobian exactly once, with no
+        # prior zeroing, at streaming bandwidth. Edge data (B, Bhat, Y, dY) is
+        # loaded once per (center, atom) pair instead of once per feature. The
+        # tile is (d, n*lm) with the feature axis last, so consecutive lanes
+        # hit consecutive addresses in every store.
+        pid = tl.program_id(0).to(tl.int64)         # c * A + a
+        c = pid // A
+        a = pid - c * A
+        ca = tl.load(cidx_ptr + c)
+        if a != ca:
+            i_offs = tl.arange(0, INP)              # flattened (n, lm)
+            i_mask = i_offs < NMAX * LMTOT
+            n_i = i_offs // LMTOT
+            lm_i = i_offs - n_i * LMTOT
+            d_offs = tl.arange(0, 4)
+            d_mask = d_offs < 3
+            mask2 = d_mask[:, None] & i_mask[None, :]
+            lidx = tl.load(lof_ptr + lm_i, mask=i_mask, other=0)
+
+            eid = tl.load(eid_ptr + pid)
+            valid = eid >= 0
+            e64 = eid.to(tl.int64)
+            lmask = i_mask & valid
+            b_ptrs = e64 * (NMAX * LP1) + n_i * LP1 + lidx
+            Bv = tl.load(b_ptr + b_ptrs, mask=lmask, other=0.0)
+            Bh = tl.load(bh_ptr + b_ptrs, mask=lmask, other=0.0)
+            Yv = tl.load(yv_ptr + e64 * LMTOT + lm_i, mask=lmask, other=0.0)
+            BhY = Bh * Yv
+            rv = tl.load(rvec_ptr + e64 * 3 + d_offs, mask=d_mask & valid, other=0.0)
+            Yg = tl.load(
+                yg_ptr + e64 * (3 * LMTOT) + d_offs[:, None] * LMTOT + lm_i[None, :],
+                mask=mask2 & valid, other=0.0,
+            )
+            g = rv[:, None] * BhY[None, :] + Bv[None, :] * Yg  # (4, INP)
+
+            sp = tl.load(nsp_ptr + e64, mask=valid, other=-1)
+            F = S * NMAX * LMTOT
+            base = (c * 3 * A + a) * F              # element offset of out[c,0,a,0]
+            out_d = d_offs.to(tl.int64)[:, None] * (A * F)
+            CL = C * LMTOT
+            col_t = n_i.to(tl.int64) * CL + c * LMTOT + lm_i
+            out_d_t = d_offs.to(tl.int64)[:, None] * A * S * NMAX * CL
+            for sp2 in tl.static_range(S):
+                val = tl.where(sp2 == sp, g, 0.0)
+                if TRANSPOSED:
+                    # out[d, a, sp2, n, c, lm]
+                    tl.store(
+                        out_ptr + out_d_t + ((a * S + sp2) * NMAX * CL + col_t)[None, :],
+                        val, mask=mask2,
+                    )
+                else:
+                    tl.store(
+                        out_ptr + base + out_d + (sp2 * NMAX * LMTOT + i_offs)[None, :],
+                        val, mask=mask2,
+                    )
+
+    @triton.jit(do_not_specialize=["A"])
+    def _soap_grad_center_kernel(
+        nsp_ptr, rvec_ptr, b_ptr, bh_ptr, yv_ptr, yg_ptr, lof_ptr,
+        cidx_ptr,                 # (C,) int32: atom index of each center
+        rowptr_ptr,               # (C+1,) int32: edge range per center (edges center-sorted)
+        out_ptr,                  # (C, 3, A, S*NMAX*LMTOT) Jacobian buffer, or
+                                  # (3, A, S, NMAX, C, LMTOT) when TRANSPOSED
+        A,
+        C,                        # number of centers (used when TRANSPOSED)
+        NMAX: tl.constexpr, LP1: tl.constexpr, LMTOT: tl.constexpr,
+        S: tl.constexpr,
+        INP: tl.constexpr,
+        TRANSPOSED: tl.constexpr = 0,
+    ):
+        # Companion of _soap_grad_stream_kernel: one program per
+        # (center, species) writes the species block of the center's own atom
+        # row, out[c, 0:3, cidx[c], sp*NMAX*LMTOT:(sp+1)*NMAX*LMTOT], as the
+        # center term -sum_e g_e over the center's edge range of that species
+        # (d r_vec/d R_center = -I). Launched on a side stream, its C*S
+        # sequential edge walks hide behind the bandwidth-bound store pass of
+        # the stream kernel, replacing the former atomic-add reduction kernel,
+        # accumulator buffer, and host-side subtraction.
+        pid = tl.program_id(0)
+        c = (pid // S).to(tl.int64)
+        sp2 = pid % S
+
+        i_offs = tl.arange(0, INP)
+        i_mask = i_offs < NMAX * LMTOT
+        n_i = i_offs // LMTOT
+        lm_i = i_offs - n_i * LMTOT
+        d_offs = tl.arange(0, 4)
+        d_mask = d_offs < 3
+        mask2 = d_mask[:, None] & i_mask[None, :]
+        lidx = tl.load(lof_ptr + lm_i, mask=i_mask, other=0)
+
+        start = tl.load(rowptr_ptr + c)
+        end = tl.load(rowptr_ptr + c + 1)
+        accv = tl.zeros((4, INP), dtype=tl.float32)
+        for e in range(start, end):
+            e64 = e.to(tl.int64)
+            spe = tl.load(nsp_ptr + e64)
+            b_ptrs = e64 * (NMAX * LP1) + n_i * LP1 + lidx
+            Bv = tl.load(b_ptr + b_ptrs, mask=i_mask, other=0.0)
+            Bh = tl.load(bh_ptr + b_ptrs, mask=i_mask, other=0.0)
+            Yv = tl.load(yv_ptr + e64 * LMTOT + lm_i, mask=i_mask, other=0.0)
+            rv = tl.load(rvec_ptr + e64 * 3 + d_offs, mask=d_mask, other=0.0)
+            Yg = tl.load(
+                yg_ptr + e64 * (3 * LMTOT) + d_offs[:, None] * LMTOT + lm_i[None, :],
+                mask=mask2, other=0.0,
+            )
+            g = rv[:, None] * (Bh * Yv)[None, :] + Bv[None, :] * Yg
+            accv += tl.where(spe == sp2, g, 0.0)
+
+        ca = tl.load(cidx_ptr + c)
+        if TRANSPOSED:
+            # out[d, ca, sp2, n, c, lm]
+            CL = C * LMTOT
+            col_t = n_i.to(tl.int64) * CL + c * LMTOT + lm_i
+            tl.store(
+                out_ptr + d_offs.to(tl.int64)[:, None] * A * S * NMAX * CL
+                + ((ca.to(tl.int64) * S + sp2) * NMAX * CL + col_t)[None, :],
+                -accv, mask=mask2,
+            )
+        else:
+            F = S * NMAX * LMTOT
+            base = (c * 3 * A + ca) * F
+            tl.store(
+                out_ptr + base + d_offs.to(tl.int64)[:, None] * (A * F)
+                + (sp2 * NMAX * LMTOT + i_offs)[None, :],
+                -accv, mask=mask2,
+            )
 
     @triton.jit(do_not_specialize=["C", "M"])
     def _nl_count_kernel(
@@ -536,14 +844,14 @@ def _i1e(t: torch.Tensor) -> torch.Tensor:
 def modified_spherical_bessel_ie(l_max: int, t: torch.Tensor) -> torch.Tensor:
     eps = 1e-12
     tt = torch.clamp(t, min=eps)
-    out = torch.zeros((l_max + 1,) + tt.shape, device=tt.device, dtype=tt.dtype)
-    out[0] = _i0e(tt)
-    if l_max == 0:
-        return out
-    out[1] = _i1e(tt)
-    for l in range(1, l_max):
-        out[l + 1] = out[l - 1] - (2 * l + 1) / tt * out[l]
-    return out
+    # built as a list + stack (not in-place writes into one tensor) so the
+    # recurrence stays differentiable for the autograd derivative backend
+    outs = [_i0e(tt)]
+    if l_max >= 1:
+        outs.append(_i1e(tt))
+        for l in range(1, l_max):
+            outs.append(outs[l - 1] - (2 * l + 1) / tt * outs[l])
+    return torch.stack(outs, dim=0)
 
 
 # ----------------------------
@@ -576,7 +884,17 @@ class SOAP:
         device: Optional[Union[str, torch.device]] = None,
         quad_n: int = 100,
         max_num_neighbors: Optional[int] = None,
+        persistent_output_buffer: bool = True,
     ):
+        """persistent_output_buffer: when True (default), derivatives() calls whose
+        centers form a contiguous index range (the batched-centers pattern, or
+        centers=None) write into one persistent (n_atoms, 3, n_atoms, n_features)
+        buffer owned by this object and return a view of the corresponding center
+        rows. Batches of one system then share a single allocation, and
+        torch.cat-ing consecutive batches is zero-copy. The trade-off is that a
+        later derivatives() call on the same object overwrites earlier returned
+        views; pass False (or .clone() the results) if you need calls to be
+        independent."""
         if n_max is None or l_max is None:
             raise ValueError("n_max and l_max must be provided.")
         if species is None or len(species) == 0:
@@ -602,6 +920,8 @@ class SOAP:
         self._atomic_number_set = set(self._atomic_numbers.tolist())
         self._Z_to_species_index = {int(z): i for i, z in enumerate(self._atomic_numbers.tolist())}
         self.n_species = int(self._atomic_numbers.numel())
+        self._maxZ = max(self._atomic_number_set)
+        self._z_lut: Dict[str, torch.Tensor] = {}
 
         self._n_max = int(n_max)
         self._l_max = int(l_max)
@@ -614,6 +934,16 @@ class SOAP:
         self.sparse = bool(sparse)
         self.quad_n = int(quad_n)
         self.max_num_neighbors = max_num_neighbors
+        self.persistent_output_buffer = bool(persistent_output_buffer)
+        # (device,dtype) -> persistent (N, 3, N, n_feat) derivative output buffer
+        self._out_buf: Dict[Tuple[str, str], torch.Tensor] = {}
+        # side CUDA stream for the center-term kernel (overlaps the Jacobian write)
+        self._center_stream: Optional[torch.cuda.Stream] = None
+        # last system's host arrays + device tensors: batched-center calls on the
+        # same structure skip the per-call H2D upload (validated by value)
+        self._sys_cache: Optional[Tuple] = None
+        # full-system edge list reused across batched-center derivative calls
+        self._edge_cache: Optional[Dict[str, Any]] = None
 
         if self.average not in ("off", "inner", "outer", "cc"):
             raise ValueError("average must be one of: 'off', 'inner', 'outer', 'cc' (cc = projection coeffs).")
@@ -679,6 +1009,24 @@ class SOAP:
             and torch.cuda.is_available()
         ):
             self._init_fused_gto()
+
+        # Warm the closed-form analytical-derivative path (sphericart gradient
+        # kernels, einsum plans, first CUDA launches) so the first user call to
+        # derivatives() is not charged for one-time setup.
+        if self._rbf == "gto" and not self.periodic and self._weighting is None and not self.sparse:
+            try:
+                z0 = int(self._atomic_numbers[0].item())
+                dummy = {
+                    "positions": torch.tensor(
+                        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], device=self.device, dtype=self.dtype
+                    ),
+                    "atomic_numbers": torch.tensor([z0, z0], device=self.device, dtype=torch.long),
+                }
+                self.derivatives_analytical_closed_form(dummy, return_descriptor=False)
+                if str(self.device).startswith("cuda") and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
 
 
     # ---- sphericart ----
@@ -867,6 +1215,30 @@ class SOAP:
 
     # ---- centers handling (DScribe-like) ----
 
+    def _system_to_tensors_cached(self, system: Any):
+        """system_to_tensors with a one-entry cache for ASE-like systems: the
+        batched-centers pattern calls create()/derivatives() many times with the
+        same structure, and each host->device upload is a blocking copy. The hit
+        test compares host arrays by value, so in-place mutation is safe."""
+        if not (hasattr(system, "get_positions") and hasattr(system, "get_atomic_numbers")):
+            return system_to_tensors(system, self.device, self.dtype)
+        pos_np = np.asarray(system.get_positions())
+        Z_np = np.asarray(system.get_atomic_numbers())
+        cell_np = np.asarray(system.get_cell().array) if hasattr(system, "get_cell") else None
+        pbc_np = np.asarray(system.get_pbc()) if hasattr(system, "get_pbc") else None
+
+        def _eq(a, b):
+            return (a is None) == (b is None) and (a is None or np.array_equal(a, b))
+
+        cache = self._sys_cache
+        if cache is not None:
+            cpos, cZ, ccell, cpbc, tensors = cache
+            if _eq(cpos, pos_np) and _eq(cZ, Z_np) and _eq(ccell, cell_np) and _eq(cpbc, pbc_np):
+                return tensors
+        tensors = system_to_tensors(system, self.device, self.dtype)
+        self._sys_cache = (pos_np, Z_np, cell_np, pbc_np, tensors)
+        return tensors
+
     def prepare_centers(
         self,
         positions: torch.Tensor,
@@ -881,6 +1253,16 @@ class SOAP:
         if centers is None:
             C = positions.shape[0]
             return positions, torch.arange(C, device=positions.device, dtype=torch.long)
+
+        if all(isinstance(c, (int, np.integer)) for c in centers):
+            lo = int(centers[0]) if len(centers) else 0
+            if all(int(c) == lo + i for i, c in enumerate(centers)):
+                # contiguous ascending indices (the batched-centers pattern):
+                # build on device instead of paying a blocking H2D copy
+                idx_t = torch.arange(lo, lo + len(centers), device=positions.device, dtype=torch.long)
+            else:
+                idx_t = torch.tensor([int(c) for c in centers], device=positions.device, dtype=torch.long)
+            return positions[idx_t], idx_t
 
         centers_xyz = []
         center_indices = []
@@ -898,12 +1280,18 @@ class SOAP:
     # ---- neighbor list (GPU) ----
 
     def _map_Z_to_species(self, Z: torch.Tensor) -> torch.Tensor:
-        maxZ = int(torch.max(Z).item()) if Z.numel() else 0
-        lut = torch.full((maxZ + 1,), -1, device=Z.device, dtype=torch.long)
-        for z, idx in self._Z_to_species_index.items():
-            if z <= maxZ:
-                lut[z] = idx
-        return lut[Z.clamp(min=0, max=maxZ)]
+        # cached per-device LUT: no device sync (max(Z).item()) and no per-call
+        # scalar H2D writes. Index maxZ+1 stays -1 so out-of-range Z maps to -1.
+        maxZ = self._maxZ
+        key = str(Z.device)
+        lut = self._z_lut.get(key)
+        if lut is None:
+            lut_host = torch.full((maxZ + 2,), -1, dtype=torch.long)
+            for z, idx in self._Z_to_species_index.items():
+                lut_host[z] = idx
+            lut = lut_host.to(Z.device)
+            self._z_lut[key] = lut
+        return lut[Z.clamp(min=0, max=maxZ + 1)]
 
     def _extend_periodic(self, positions: torch.Tensor, Z: torch.Tensor, cell: torch.Tensor, pbc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         offsets = _pbc_offsets(cell, pbc, self._cutoff)  # (n_img,3) ints
@@ -931,6 +1319,25 @@ class SOAP:
             t = torch.empty(new_shape, device=device, dtype=dtype)
             self._scratch[key] = t
         return t
+
+    def _persistent_out_slice(
+        self, n_atoms: int, n_feat: int, lo: int, hi: int,
+        device: torch.device, dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Rows [lo, hi) of the persistent (n_atoms, 3, n_atoms, n_feat) derivative
+        output buffer for (device, dtype), (re)allocating it on size change. The
+        slice is a view; its content is NOT zeroed here."""
+        key = (str(device), str(dtype))
+        buf = self._out_buf.get(key)
+        if buf is None or int(buf.shape[0]) != n_atoms or int(buf.shape[3]) != n_feat:
+            if buf is not None:
+                _OUT_BUFFERS.pop(buf.untyped_storage().data_ptr(), None)
+                del buf
+                self._out_buf.pop(key, None)
+            buf = torch.empty((n_atoms, 3, n_atoms, n_feat), device=device, dtype=dtype)
+            self._out_buf[key] = buf
+            _register_out_buffer(buf)
+        return buf[lo:hi]
 
     def _radius_edges(
         self,
@@ -1099,6 +1506,25 @@ class SOAP:
         out["alphas"] = self._alphas.to(device=device, dtype=dtype)
         out["betas"]  = self._betas.to(device=device, dtype=dtype)
         out["eta"]    = torch.tensor(self._eta, device=device, dtype=dtype)
+        if self._rbf == "gto":
+            # derived radial constants for the closed-form derivative path
+            alphas, betas, eta = out["alphas"], out["betas"], out["eta"]
+            Lp1 = self._l_max + 1
+            p_all = alphas + eta                                  # (Lp1,nmax)
+            gamma_all = alphas * eta / p_all                      # (Lp1,nmax)
+            l_col = torch.arange(Lp1, device=device, dtype=dtype)[:, None]
+            out["gamma_all"] = gamma_all
+            out["pref_all"] = (math.pi ** 1.5) * (eta / p_all) ** l_col * p_all ** (-1.5)
+            # betas and betas*(-2*gamma) stacked: B and Bhat in one contraction
+            out["betas_pair"] = torch.stack(
+                [betas, betas * (-2.0 * gamma_all)[:, None, :]]
+            ).contiguous()
+            l_of_lm = torch.tensor(
+                [l for l in range(Lp1) for _ in range(2 * l + 1)],
+                device=device, dtype=torch.long,
+            )
+            out["l_of_lm"] = l_of_lm
+            out["l_of_lm32"] = l_of_lm.to(torch.int32)
         # Polynomial backend constants (if initialized)
         if hasattr(self, "_rx"):
             out["rx"] = self._rx.to(device=device, dtype=dtype)
@@ -1313,11 +1739,28 @@ class SOAP:
             self._use_fused_nl = False
 
         # Pre-grow the CUDA caching-allocator pool: the first large allocation
-        # (e.g. the harmonics buffer for a big system) otherwise pays a slow
-        # cudaMalloc inside the first create() call.
+        # otherwise pays a slow cudaMalloc inside the first timed call. With the
+        # persistent derivative output buffer this can be a large fraction of
+        # device memory (an (N, F, N, 3) Jacobian), so grow one big cached block
+        # up front -- torch.empty + del returns it to the allocator cache, from
+        # which later allocations (including the multi-GB buffer) split
+        # instantly. Overridable via SOAP_PREGROW_GB (0 disables).
         try:
             free_b, _ = torch.cuda.mem_get_info(self.device)
-            n = int(min(free_b * 0.5, float(12 << 30)))
+            env = os.environ.get("SOAP_PREGROW_GB")
+            if env is not None:
+                n = int(float(env) * (1 << 30))
+            elif self.persistent_output_buffer and self.average == "cc":
+                # 'cc' keeps the raw (N, 3, N, S*nmax*(l_max+1)^2) coefficient
+                # Jacobian in the persistent buffer, which for large systems is a
+                # large fraction of device memory -- grow most of the pool.
+                n = int(free_b * 0.75)
+            else:
+                # power-spectrum averages: the persistent buffer plus transients
+                # is a few GB for typical batched-center runs; growing the whole
+                # pool would only inflate peak memory.
+                n = int(min(free_b * 0.5, 2.25 * (1 << 30)))
+            n = min(n, int(free_b * 0.95))
             if n > 0:
                 buf = torch.empty((n,), dtype=torch.uint8, device=self.device)
                 del buf
@@ -1626,9 +2069,11 @@ class SOAP:
 
     # ---- output assembly ----
 
-    def _prefactor_l(self, l: int, device, dtype) -> torch.Tensor:
-        # standard SOAP prefactor: sqrt(8*pi^2 / (2l+1))
-        return torch.tensor(math.sqrt(8.0 * math.pi * math.pi / (2 * l + 1)), device=device, dtype=dtype)
+    def _prefactor_l(self, l: int, device, dtype) -> float:
+        # standard SOAP prefactor: sqrt(8*pi^2 / (2l+1)). Returned as a Python
+        # scalar: every caller multiplies it into a tensor, and a device-side
+        # 0-dim tensor here would pay a blocking H2D copy per call.
+        return math.sqrt(8.0 * math.pi * math.pi / (2 * l + 1))
 
     def _projection_cc(self, coeffs: List[torch.Tensor]) -> torch.Tensor:
         C = coeffs[0].shape[0]
@@ -1728,7 +2173,7 @@ class SOAP:
                 return outputs
 
         # single system
-        positions, Z, cell, pbc = system_to_tensors(system, self.device, self.dtype)
+        positions, Z, cell, pbc = self._system_to_tensors_cached(system)
         # validate species
         bad = set(torch.unique(Z).tolist()) - self._atomic_number_set
         if bad:
@@ -1841,8 +2286,7 @@ class SOAP:
         """
         Numerical derivatives using central differences.
 
-        DScribe DescriptorLocal convention:
-          derivatives shape: (n_centers, n_atoms_included, 3, n_features)
+        Derivatives shape: (n_centers, 3, n_atoms_included, n_features)
 
         include/exclude:
           - include: list of atom indices to differentiate w.r.t.
@@ -1878,7 +2322,7 @@ class SOAP:
 
         # output tensor
         n_feat = self.get_number_of_features() if self.average != "cc" else self.get_number_of_features()
-        deriv = torch.zeros((n_centers, len(idx), 3, n_feat), device=self.device, dtype=self.dtype)
+        deriv = torch.zeros((n_centers, 3, len(idx), n_feat), device=self.device, dtype=self.dtype)
 
         # Central difference for each atom and component
         # This is expensive; use only when you truly need derivatives.
@@ -1925,10 +2369,10 @@ class SOAP:
                 if f_p.dim() == 1:
                     # global: treat as one "center"
                     df = (f_p - f_m) / (2.0 * d)
-                    deriv[:, ai, comp, :] = df[None, :].expand(n_centers, -1)
+                    deriv[:, comp, ai, :] = df[None, :].expand(n_centers, -1)
                 else:
                     df = (f_p - f_m) / (2.0 * d)
-                    deriv[:, ai, comp, :] = df
+                    deriv[:, comp, ai, :] = df
 
         return (deriv, desc0) if return_descriptor else deriv
 
@@ -1956,8 +2400,8 @@ class SOAP:
         d c_{nlm}/d x_j as derived in SOAP.pdf; for the power-spectrum averages it is
         that gradient propagated through p = sum_m c_{nlm} c'_{nlm}.
 
-        Output follows the DScribe convention:
-            (n_centers, n_atoms_included, 3, n_features)
+        Output shape:
+            (n_centers, 3, n_atoms_included, n_features)
 
         Notes
         -----
@@ -1970,6 +2414,24 @@ class SOAP:
           is non-differentiable by nature; the descriptor is exactly differentiable
           everywhere except on the measure-zero cutoff shell, exactly as in DScribe.
         """
+        # Fast path: the closed-form Jacobian (solid-harmonic gradients, no autograd
+        # graph) covers every average mode for gto / non-periodic / unweighted SOAP
+        # and is orders of magnitude faster than the batched reverse-mode pass below
+        # (one backward per output feature). Fall through to autograd otherwise.
+        if (
+            self._rbf == "gto"
+            and not self.periodic
+            and self._weighting is None
+            and not self.sparse
+        ):
+            return self.derivatives_analytical_closed_form(
+                system,
+                centers=centers,
+                include=include,
+                exclude=exclude,
+                return_descriptor=return_descriptor,
+            )
+
         positions, Z, cell, pbc = system_to_tensors(system, self.device, self.dtype)
         n_atoms = int(positions.shape[0])
 
@@ -2023,10 +2485,10 @@ class SOAP:
                 g = torch.autograd.grad(flat[p], pos, retain_graph=True)[0]
                 jflat[p] = g
 
-        # (R, n_feat, n_atoms, 3) -> select included atoms -> (R, n_inc, 3, n_feat)
-        jac_sel = jac[:, :, idx_t, :].permute(0, 2, 3, 1).contiguous()
+        # (R, n_feat, n_atoms, 3) -> select included atoms -> (R, 3, n_inc, n_feat)
+        jac_sel = jac[:, :, idx_t, :].permute(0, 3, 2, 1).contiguous()
         if global_avg:
-            deriv = jac_sel.expand(n_centers, len(idx), 3, n_feat).contiguous()
+            deriv = jac_sel.expand(n_centers, 3, len(idx), n_feat).contiguous()
         else:
             deriv = jac_sel
 
@@ -2062,26 +2524,39 @@ class SOAP:
         The position-independent self-term (the δ_{l0} contribution of the central
         Gaussian at r=0) drops out of the derivative.
 
-        Restricted to rbf='gto', average='cc', non-periodic, weighting=None -- the
-        setting of the SOAP.pdf derivation and of the force-prediction descriptor.
-        For anything else use derivatives_analytical (autograd), which is general.
+        For the power-spectrum modes (average='off'/'inner'/'outer') the coefficient
+        gradient is propagated exactly through the bilinear power spectrum
+            p_l(n,n') = pref_l * sum_m c_{nlm} c'_{n'lm}
+            dp = pref_l * sum_m (dc * c' + c * dc')
+        with the same DScribe feature ordering as the forward pass; 'inner' averages
+        the coefficients (and their gradients) over centers before the product,
+        'outer' averages the per-center gradients after it.
 
-        Output: (n_centers, n_atoms_included, 3, n_features), DScribe convention.
+        Restricted to rbf='gto', non-periodic, weighting=None -- the setting of the
+        SOAP.pdf derivation. For anything else use derivatives_analytical (autograd),
+        which is general.
+
+        Output: (n_centers, 3, n_atoms_included, n_features) -- center-batches
+        concatenate along dim 0 into the full (n_atoms, 3, n_atoms, n_features)
+        Jacobian.
         """
         if self._rbf != "gto":
             raise NotImplementedError("closed-form derivative needs rbf='gto'; use derivatives_analytical.")
-        if self.average != "cc":
-            raise NotImplementedError("closed-form derivative needs average='cc'; use derivatives_analytical.")
         if self.periodic:
             raise NotImplementedError("closed-form derivative is non-periodic; use derivatives_analytical.")
         if self._weighting is not None:
             raise NotImplementedError("closed-form derivative assumes weighting=None; use derivatives_analytical.")
 
-        positions, Z, cell, pbc = system_to_tensors(system, self.device, self.dtype)
+        positions, Z, cell, pbc = self._system_to_tensors_cached(system)
         device, dtype = positions.device, positions.dtype
         n_atoms = int(positions.shape[0])
 
-        bad = set(torch.unique(Z).tolist()) - self._atomic_number_set
+        # species check without a GPU->CPU sync when the source numbers are on host
+        nums = getattr(system, "numbers", None)
+        if nums is not None:
+            bad = set(np.unique(np.asarray(nums)).tolist()) - self._atomic_number_set
+        else:
+            bad = set(torch.unique(Z).tolist()) - self._atomic_number_set
         if bad:
             raise ValueError(f"System contains atomic numbers not in species list: {sorted(bad)}")
 
@@ -2094,99 +2569,476 @@ class SOAP:
             ex = set(int(i) for i in exclude)
             idx = [i for i in idx if i not in ex]
         n_inc = len(idx)
-        inv = torch.full((n_atoms,), -1, device=device, dtype=torch.long)  # atom -> out row (or -1)
-        for out_pos, a in enumerate(idx):
-            inv[a] = out_pos
+        all_included = (include is None and exclude is None)
+        if all_included:
+            inv = torch.arange(n_atoms, device=device, dtype=torch.long)
+        else:
+            inv = torch.full((n_atoms,), -1, device=device, dtype=torch.long)  # atom -> out row (or -1)
+            inv[torch.tensor(idx, device=device, dtype=torch.long)] = torch.arange(
+                n_inc, device=device, dtype=torch.long
+            )
 
         centers_xyz, center_indices = self.prepare_centers(positions, centers)
         n_centers = int(centers_xyz.shape[0])
+        # known on the host without touching the GPU: every center is an atom index
+        centers_all_atoms = centers is None or all(
+            isinstance(c, (int, np.integer)) for c in centers
+        )
+        # contiguous ascending center range [c_lo, c_hi) -> the output rows are a
+        # dim-0 slice of the full (n_atoms, ...) Jacobian, so the persistent
+        # output buffer can back them with a view
+        if centers is None:
+            c_lo, c_hi = 0, n_atoms
+        elif (
+            centers_all_atoms
+            and len(centers) > 0
+            and all(int(c) == int(centers[0]) + i for i, c in enumerate(centers))
+            and 0 <= int(centers[0])
+            and int(centers[0]) + len(centers) <= n_atoms
+        ):
+            c_lo, c_hi = int(centers[0]), int(centers[0]) + len(centers)
+        else:
+            c_lo = c_hi = None
 
         S = self.n_species
         nmax = self._n_max
         Lp1 = self._l_max + 1
         L = Lp1 * Lp1
-        n_feat = S * nmax * L
-
-        deriv = torch.zeros((n_centers, n_inc, 3, n_feat), device=device, dtype=dtype)
-        desc0 = self.create(system, centers).detach() if return_descriptor else None
+        n_feat = self.n_features
 
         # ---- neighbor list that *keeps* the neighbor atom index (non-periodic) ----
+        # For the batched-centers pattern (contiguous atom-index ranges over one
+        # unchanged system) the full-system edge list is computed ONCE and every
+        # batch takes slice views of it: after the first batch the per-call path
+        # contains no host-device synchronization (nonzero/boolean masking), so
+        # the CPU can run ahead and keep the GPU pipeline full across batches.
         eps_self = 1e-8 if dtype == torch.float32 else 1e-12
-        center_idx, neigh_idx = self._radius_edges(centers_xyz, positions, self._cutoff)
-        if center_idx.numel() > 0:
-            rvec = positions[neigh_idx] - centers_xyz[center_idx]
-            r = torch.linalg.norm(rvec, dim=-1)
-            keep = r > eps_self
-            center_idx, neigh_idx, rvec, r = center_idx[keep], neigh_idx[keep], rvec[keep], r[keep]
-        E = int(center_idx.numel())
+        rowptr_batch = None  # (n_centers+1,) long, edge offsets per center (fast path)
+        ecache = self._edge_cache
+        cacheable = centers_all_atoms and c_lo is not None
+        if cacheable and not (
+            ecache is not None
+            and ecache["pos"] is positions
+            and ecache["cutoff"] == self._cutoff
+        ):
+            ce, ne = self._radius_edges(positions, positions, self._cutoff)
+            if ce.numel() > 0:
+                # the GEMM backend emits edges via nonzero(), which is already
+                # row-major (sorted by center); only other backends need the sort
+                if self._last_nl_backend != "gemm":
+                    ce, order = torch.sort(ce, stable=True)
+                    ne = ne[order]
+                rv = positions[ne] - positions[ce]
+                rr = torch.linalg.norm(rv, dim=-1)
+                keep = rr > eps_self
+                ce, ne, rv, rr = ce[keep], ne[keep], rv[keep].contiguous(), rr[keep]
+            rowptr_full = torch.zeros(n_atoms + 1, device=device, dtype=torch.long)
+            rowptr_full[1:] = torch.bincount(ce, minlength=n_atoms).cumsum(0)
+            # solid harmonics for ALL edges up front: sphericart synchronizes
+            # with the stream internally, so calling it per batch would stall
+            # the CPU behind the previous batch's GPU work
+            Yv_all, Yg_all = self._Ysolid.compute_with_gradients(rv)
+            ecache = self._edge_cache = {
+                "pos": positions,
+                "cutoff": self._cutoff,
+                "ce": ce,
+                "ne": ne,
+                "rvec": rv,
+                "r": rr,
+                "sp": self._map_Z_to_species(Z[ne]),
+                "Yval": Yv_all,
+                "Ygrad": Yg_all,
+                "rowptr": rowptr_full,
+                "rowptr_host": rowptr_full.cpu().tolist(),
+            }
+        Yval_cached = Ygrad_cached = None
+        if cacheable:
+            s0 = ecache["rowptr_host"][c_lo]
+            s1 = ecache["rowptr_host"][c_hi]
+            E = s1 - s0
+            center_idx = ecache["ce"][s0:s1] - c_lo
+            neigh_idx = ecache["ne"][s0:s1]
+            rvec = ecache["rvec"][s0:s1]
+            r = ecache["r"][s0:s1]
+            neigh_sp = ecache["sp"][s0:s1]
+            Yval_cached = ecache["Yval"][s0:s1]
+            Ygrad_cached = ecache["Ygrad"][s0:s1]
+            rowptr_batch = ecache["rowptr"][c_lo:c_hi + 1] - s0
+        else:
+            center_idx, neigh_idx = self._radius_edges(centers_xyz, positions, self._cutoff)
+            if center_idx.numel() > 0:
+                # edges must be sorted by center so each center's edges are
+                # contiguous (the stream kernel walks a per-center rowptr range);
+                # the GEMM backend's nonzero() output is already in that order
+                if self._last_nl_backend != "gemm":
+                    center_idx, order = torch.sort(center_idx, stable=True)
+                    neigh_idx = neigh_idx[order]
+                rvec = positions[neigh_idx] - centers_xyz[center_idx]
+                r = torch.linalg.norm(rvec, dim=-1)
+                keep = r > eps_self
+                center_idx, neigh_idx, rvec, r = center_idx[keep], neigh_idx[keep], rvec[keep], r[keep]
+            E = int(center_idx.numel())
+            neigh_sp = self._map_Z_to_species(Z[neigh_idx]) if E > 0 else None
 
         if E == 0:
+            deriv = torch.zeros((n_centers, 3, n_inc, n_feat), device=device, dtype=dtype)
+            desc0 = self.create(system, centers).detach() if return_descriptor else None
             return (deriv, desc0) if return_descriptor else deriv
 
-        neigh_sp = self._map_Z_to_species(Z[neigh_idx])  # (E,) species column for each edge
-
         const = self._get_const(device, dtype)
-        alphas = const["alphas"]   # (Lp1, nmax)
-        betas = const["betas"]     # (Lp1, nmax, nmax)
-        eta = const["eta"]
         r2 = r * r
 
         # B[e,n,l]   = sum_k beta^l_{nk} * pref_kl * e^{-gamma_kl r^2}              (radial, no r^l)
         # Bhat[e,n,l]= sum_k beta^l_{nk} * (-2 gamma_kl) * pref_kl * e^{-gamma_kl r^2}
-        B = torch.zeros((E, nmax, Lp1), device=device, dtype=dtype)
-        Bhat = torch.zeros((E, nmax, Lp1), device=device, dtype=dtype)
-        for l in range(Lp1):
-            alpha_l = alphas[l]                 # (nmax,)
-            beta_l = betas[l]                   # (nmax,nmax)
-            p = alpha_l + eta                   # (nmax,)
-            gamma = alpha_l * eta / p           # (nmax,)  == alpha/(1+2 sigma^2 alpha)
-            pref = (math.pi ** 1.5) * (eta / p) ** l * (p ** (-1.5))   # (nmax,)
-            Q = pref[None, :] * torch.exp(-gamma[None, :] * r2[:, None])  # (E,nmax)
-            B[:, :, l] = Q @ beta_l.transpose(0, 1)
-            Bhat[:, :, l] = (-2.0 * gamma[None, :] * Q) @ beta_l.transpose(0, 1)
+        # (vectorized over l: one exp + one batched contraction for both, using
+        # the cached stacked [betas, betas*(-2 gamma)] pair)
+        Q = const["pref_all"][None, :, :] * torch.exp(
+            -const["gamma_all"][None, :, :] * r2[:, None, None]
+        )  # (E,Lp1,nmax)
+        BB = torch.einsum("elk,tlnk->tenl", Q, const["betas_pair"])  # (2,E,nmax,Lp1)
+        B, Bhat = BB[0], BB[1]
 
         # expand l -> (l,m) columns
-        l_of_lm = torch.tensor(
-            [l for l in range(Lp1) for _ in range(2 * l + 1)], device=device, dtype=torch.long
-        )  # (L,)
-        B_lm = B[:, :, l_of_lm]       # (E, nmax, L)
-        Bhat_lm = Bhat[:, :, l_of_lm]  # (E, nmax, L)
+        l_of_lm = const["l_of_lm"]  # (L,)
 
         # real solid harmonics r^l Y_lm and their exact Cartesian gradients
-        Yval, Ygrad = self._Ysolid.compute_with_gradients(rvec)  # (E,L), (E,3,L)
+        if Yval_cached is not None:
+            Yval, Ygrad = Yval_cached, Ygrad_cached  # (E,L), (E,3,L) slice views
+        else:
+            Yval, Ygrad = self._Ysolid.compute_with_gradients(rvec)
 
-        # edge gradient  g[e,d,n,lm] = d/dr_d ( B_lm * Yval )
-        #   = (r_d * Bhat_lm) * Yval     (Gaussian-width term)
-        #   +  B_lm * dYval/dr_d         (solid-harmonic term)
-        term_gauss = rvec[:, :, None, None] * (Bhat_lm[:, None, :, :] * Yval[:, None, None, :])
-        term_solid = B_lm[:, None, :, :] * Ygrad[:, :, None, :]
-        g = term_gauss + term_solid  # (E, 3, nmax, L)
-
-        # ---- scatter edge gradients to (center, atom, component, species, n, lm) ----
+        # ---- scatter edge gradients to (center, component, atom, species, n, lm) ----
         # d r_vec/d R_neigh = +I ;  d r_vec/d R_center_atom = -I
-        deriv_flat = torch.zeros((n_centers * n_inc * S, 3, nmax, L), device=device, dtype=dtype)
-
-        op_n = inv[neigh_idx]                       # out row of the neighbor atom (or -1)
-        valid_n = op_n >= 0
-        t_n = (center_idx * n_inc + op_n) * S + neigh_sp
-        if torch.any(valid_n):
-            deriv_flat.index_add_(0, t_n[valid_n], g[valid_n])
-
-        a_c = center_indices[center_idx]            # atom index of each edge's center (or -1)
-        op_c = torch.where(a_c >= 0, inv[a_c.clamp(min=0)], torch.full_like(a_c, -1))
-        valid_c = op_c >= 0
-        t_c = (center_idx * n_inc + op_c) * S + neigh_sp
-        if torch.any(valid_c):
-            deriv_flat.index_add_(0, t_c[valid_c], -g[valid_c])
-
-        # (n_centers, n_inc, S, 3, nmax, L) -> (n_centers, n_inc, 3, S, nmax, L) -> features
-        deriv = (
-            deriv_flat.reshape(n_centers, n_inc, S, 3, nmax, L)
-            .permute(0, 1, 3, 2, 4, 5)
-            .reshape(n_centers, n_inc, 3, n_feat)
-            .contiguous()
+        # The fused-path buffer is laid out directly in the requested output axis
+        # order (n_centers, 3, n_inc, n_features) with the feature axis expanded
+        # to (S, nmax, L), so no permute / contiguous copy of the (potentially
+        # multi-GB) Jacobian is ever needed.
+        fused = (
+            _HAS_TRITON
+            and device.type == "cuda"
+            and dtype == torch.float32
+            and all_included
+            and centers_all_atoms
+        )
+        use_buf = (
+            self.persistent_output_buffer
+            and fused
+            and self.average == "cc"
+            and c_lo is not None
         )
 
+        B_lm = Bhat_lm = None
+        dperm_t = None  # kernels wrote the GEMM-ready transposed layout
+        if fused:
+            # Two concurrent kernels, no zero-fill of the multi-GB output:
+            #  * _soap_grad_stream_kernel writes every byte of the Jacobian
+            #    except each center's own atom row in one coalesced pass (edge
+            #    gradient where (center, atom) is an edge, 0 elsewhere), so
+            #    the buffer never needs prior zeroing.
+            #  * _soap_grad_center_kernel (side stream, hidden behind the
+            #    store pass) writes the center rows -sum_e g_e directly.
+            # The (E,3,nmax,L) tensor g is never materialized.
+            stream = os.environ.get("SOAP_STREAM", "1") != "0"
+            if use_buf:
+                out_view = self._persistent_out_slice(n_atoms, n_feat, c_lo, c_hi, device, dtype)
+                dcj = out_view.view(n_centers, 3, n_inc, S, nmax, L)
+                if not stream:
+                    dcj.zero_()
+            elif stream and self.average == "outer":
+                # 'outer' consumes the coefficient Jacobian only through the
+                # (3, A, S, n, C*lm) GEMM below, so the kernels write that
+                # layout directly (TRANSPOSED=1): the (C, 3, A, S, n, lm)
+                # intermediate and its multi-hundred-MB transpose vanish.
+                dp_key = ("dperm", str(device), str(dtype))
+                dp_shape = (3, n_inc, S, nmax, n_centers, L)
+                dperm_t = self._scratch.get(dp_key)
+                if dperm_t is None or dperm_t.shape != dp_shape:
+                    dperm_t = torch.empty(dp_shape, device=device, dtype=dtype)
+                    self._scratch[dp_key] = dperm_t
+                dcj = None
+            elif stream and self.average != "cc":
+                # persistent scratch (exact shape: the kernels rely on dcj being
+                # contiguous): the multi-hundred-MB coefficient Jacobian is
+                # reused across center batches instead of cycling through the
+                # allocator, whose blocks can't be recycled while the GPU still
+                # runs behind the CPU. Only for the power-spectrum averages,
+                # where dcj is purely internal ('cc' returns it to the caller).
+                dcj_key = ("dcj", str(device), str(dtype))
+                dcj = self._scratch.get(dcj_key)
+                if dcj is None or dcj.shape != (n_centers, 3, n_inc, S, nmax, L):
+                    dcj = torch.empty((n_centers, 3, n_inc, S, nmax, L), device=device, dtype=dtype)
+                    self._scratch[dcj_key] = dcj
+            elif stream:
+                dcj = torch.empty((n_centers, 3, n_inc, S, nmax, L), device=device, dtype=dtype)
+            else:
+                dcj = torch.zeros((n_centers, 3, n_inc, S, nmax, L), device=device, dtype=dtype)
+            rvec_c, B_c, Bhat_c = rvec.contiguous(), B.contiguous(), Bhat.contiguous()
+            Yval_c, Ygrad_c = Yval.contiguous(), Ygrad.contiguous()
+            if rvec_c.data_ptr() % 16:
+                # edge-cache slices can start at any edge offset; realign so the
+                # Triton kernels keep a single (16B-aligned) specialization
+                # instead of JIT-loading a second binary mid-run
+                rvec_c = rvec_c.clone()
+            lof32 = const["l_of_lm32"]
+            if stream:
+                neigh_sp32 = neigh_sp.to(torch.int32)
+                eid = torch.full((n_centers, n_inc), -1, device=device, dtype=torch.int32)
+                eid.view(-1)[center_idx * n_inc + neigh_idx] = torch.arange(
+                    E, device=device, dtype=torch.int32
+                )
+                cidx32 = center_indices.to(torch.int32)
+                if rowptr_batch is not None:
+                    rowptr32 = rowptr_batch.to(torch.int32)
+                else:
+                    rowptr = torch.zeros(n_centers + 1, device=device, dtype=torch.long)
+                    rowptr[1:] = torch.bincount(center_idx, minlength=n_centers).cumsum(0)
+                    rowptr32 = rowptr.to(torch.int32)
+                # Two kernels write disjoint bytes of the Jacobian: the stream
+                # kernel covers every (center, atom) row except each center's
+                # own atom row, which the center kernel fills with the center
+                # term on a side stream, hidden behind the big store pass.
+                sstream = self._center_stream
+                if sstream is None:
+                    sstream = self._center_stream = torch.cuda.Stream(device=device)
+                cur = torch.cuda.current_stream(device)
+                sstream.wait_stream(cur)
+                out_t = dperm_t if dperm_t is not None else dcj
+                trans = 1 if dperm_t is not None else 0
+                with torch.cuda.stream(sstream):
+                    _soap_grad_center_kernel[(n_centers * S,)](
+                        neigh_sp32, rvec_c, B_c, Bhat_c, Yval_c, Ygrad_c, lof32,
+                        cidx32, rowptr32,
+                        out_t, n_inc, n_centers,
+                        NMAX=nmax, LP1=Lp1, LMTOT=L, S=S,
+                        INP=_next_pow2(nmax * L), TRANSPOSED=trans, num_warps=4,
+                    )
+                    # no record_stream here: cur.wait_stream(sstream) below
+                    # orders every later op (and any allocator reuse of these
+                    # blocks) after the side-stream kernel, and record_stream
+                    # would pin the multi-hundred-MB blocks until the GPU
+                    # catches up, forcing fresh cudaMallocs while it is busy
+                _soap_grad_stream_kernel[(n_centers * n_inc,)](
+                    eid, neigh_sp32, rvec_c, B_c, Bhat_c, Yval_c, Ygrad_c, lof32,
+                    cidx32, rowptr32,
+                    out_t, n_inc, n_centers,
+                    NMAX=nmax, LP1=Lp1, LMTOT=L, S=S,
+                    INP=_next_pow2(nmax * L), TRANSPOSED=trans, num_warps=4,
+                )
+                cur.wait_stream(sstream)
+            else:
+                rows_c = (center_idx * S + neigh_sp) * (nmax * L * 3)  # acc rows
+                acc = torch.zeros((n_centers * S, nmax * L, 3), device=device, dtype=dtype)
+                # atom-major layout: an edge's (n,lm) block is contiguous
+                # (element stride 1), and the Cartesian planes are
+                # S*nmax*L*n_inc elements apart
+                rows_n = (center_idx * (3 * n_inc) + neigh_idx) * (S * nmax * L) + neigh_sp * (nmax * L)
+                _soap_grad_scatter_kernel[(E,)](
+                    rvec_c, B_c, Bhat_c, Yval_c, Ygrad_c, lof32,
+                    rows_n, rows_c, dcj, acc, E, 1, S * nmax * L * n_inc,
+                    NMAX=nmax, LP1=Lp1, LMTOT=L,
+                    INP=_next_pow2(nmax * L), WRITE_OUT=1, num_warps=4,
+                )
+                # subtract the accumulated center term at each center's own atom column
+                dv = dcj.view(n_centers, 3, n_inc, S, nmax * L)
+                cen = torch.arange(n_centers, device=device, dtype=torch.long)
+                dv[cen, :, center_indices] -= acc.view(
+                    n_centers, S, nmax * L, 3
+                ).permute(0, 3, 1, 2)
+            # (C, A, 3, S, nmax, L) axis view for the power-spectrum chain rule
+            d_caxs = dcj.permute(0, 2, 1, 3, 4, 5) if dcj is not None else None
+        else:
+            dcj = None
+            d_caxs = torch.zeros((n_centers, n_inc, 3, S, nmax, L), device=device, dtype=dtype)
+            dflat = d_caxs.view(n_centers * n_inc * 3 * S, nmax * L)
+            B_lm = B[:, :, l_of_lm]       # (E, nmax, L)
+            Bhat_lm = Bhat[:, :, l_of_lm]  # (E, nmax, L)
+
+            # edge gradient  g[e,d,n,lm] = d/dr_d ( B_lm * Yval )
+            #   = (r_d * Bhat_lm) * Yval     (Gaussian-width term)
+            #   +  B_lm * dYval/dr_d         (solid-harmonic term)
+            term_gauss = rvec[:, :, None, None] * (Bhat_lm[:, None, :, :] * Yval[:, None, None, :])
+            term_solid = B_lm[:, None, :, :] * Ygrad[:, :, None, :]
+            g = term_gauss + term_solid  # (E, 3, nmax, L)
+
+            d_off = (torch.arange(3, device=device, dtype=torch.long) * S)[None, :]  # (1,3)
+
+            op_n = inv[neigh_idx]                       # out row of the neighbor atom (or -1)
+            rows_n = ((center_idx * n_inc + op_n) * (3 * S) + neigh_sp)[:, None] + d_off  # (E,3)
+            if all_included:
+                dflat.index_add_(0, rows_n.reshape(-1), g.reshape(E * 3, nmax * L))
+            else:
+                valid_n = op_n >= 0
+                dflat.index_add_(0, rows_n[valid_n].reshape(-1), g[valid_n].reshape(-1, nmax * L))
+
+            a_c = center_indices[center_idx]            # atom index of each edge's center (or -1)
+            if centers_all_atoms and all_included:
+                rows_c = ((center_idx * n_inc + a_c) * (3 * S) + neigh_sp)[:, None] + d_off
+                dflat.index_add_(0, rows_c.reshape(-1), g.reshape(E * 3, nmax * L), alpha=-1.0)
+            else:
+                op_c = torch.where(a_c >= 0, inv[a_c.clamp(min=0)], torch.full_like(a_c, -1))
+                valid_c = op_c >= 0
+                rows_c = ((center_idx * n_inc + op_c) * (3 * S) + neigh_sp)[:, None] + d_off
+                dflat.index_add_(0, rows_c[valid_c].reshape(-1), g[valid_c].reshape(-1, nmax * L), alpha=-1.0)
+
+        # ---- coefficients c[c, s, n, lm], reusing the same edge quantities ----
+        # (needed for the power-spectrum chain rule and for return_descriptor;
+        #  identical to the forward pass: c = scatter_e B_lm[e,n,lm] * Yval[e,lm])
+        c_full = None
+        if self.average != "cc" or return_descriptor:
+            if B_lm is None:
+                B_lm = B[:, :, l_of_lm]  # (E, nmax, L)
+            contrib = (B_lm * Yval[:, None, :]).reshape(E, nmax * L)
+            c_acc = torch.zeros((n_centers * S, nmax * L), device=device, dtype=dtype)
+            c_acc.index_add_(0, center_idx * S + neigh_sp, contrib)
+            c_full = c_acc.view(n_centers, S, nmax, L)
+            # analytic self-term (l=0, m=0) for centers sitting on an atom;
+            # position-independent, so it enters c but not dc.
+            if centers_all_atoms:
+                # every center is an atom of a listed species: no masking (and
+                # no boolean-index device sync) needed
+                cen_ids = torch.arange(n_centers, device=device, dtype=torch.long)
+                sp_c = self._map_Z_to_species(Z[center_indices])
+                c_full[cen_ids, sp_c, :, 0] += self._self_l0.to(device=device, dtype=dtype)
+            else:
+                csm = center_indices >= 0
+                cen_ids = torch.arange(n_centers, device=device, dtype=torch.long)[csm]
+                sp_c = self._map_Z_to_species(Z[center_indices[csm]])
+                ok = sp_c >= 0
+                c_full[cen_ids[ok], sp_c[ok], :, 0] += self._self_l0.to(device=device, dtype=dtype)
+
+        if self.average == "cc":
+            if dcj is not None:
+                # buffer is already in output order: (C, 3, A, (S,nmax,L)=n_feat)
+                deriv = dcj.view(n_centers, 3, n_inc, n_feat)
+            else:
+                deriv = d_caxs.permute(0, 2, 1, 3, 4, 5).reshape(n_centers, 3, n_inc, n_feat)
+            desc0 = self._projection_cc(
+                [c_full[:, :, :, l * l:(l + 1) * (l + 1)] for l in range(Lp1)]
+            ).detach() if return_descriptor else None
+            return (deriv, desc0) if return_descriptor else deriv
+
+        # ---- power spectrum: dp = pref_l * sum_m (dc * c' + c * dc') ----
+        if self.average == "inner":
+            c_use = c_full.mean(dim=0, keepdim=True)
+            d_use = d_caxs.mean(dim=0, keepdim=True)
+        else:
+            c_use = c_full
+            d_use = d_caxs
+        C_use = int(c_use.shape[0])
+
+        if self._feat_slices is None:
+            self._build_feature_slices()
+        triu_i = self._triu[0]
+        triu_j = self._triu[1]
+
+        # Persistent output buffer for the power-spectrum averages too: batches
+        # of the same system write disjoint dim-0 slices of one
+        # (n_atoms, 3, n_atoms, n_feat) buffer, so torch.cat over consecutive
+        # batches is zero-copy and the concatenated Jacobian is never allocated
+        # (or copied) a second time.
+        out_view = None
+        if (
+            self.persistent_output_buffer
+            and all_included
+            and centers_all_atoms
+            and c_lo is not None
+            and device.type == "cuda"
+        ):
+            try:
+                out_view = self._persistent_out_slice(n_atoms, n_feat, c_lo, c_hi, device, dtype)
+            except torch.cuda.OutOfMemoryError:
+                out_view = None
+
+        if self.average == "outer":
+            # 'outer' only needs the center-averaged gradient, so fold the mean
+            # over centers directly into the contraction: the per-center power
+            # spectrum gradient (Cu, 3, A, ...) -- ~Cu times the size of the
+            # result -- is never materialized.
+            dglob = torch.empty((3, n_inc, n_feat), device=device, dtype=dtype)
+            inv_C = 1.0 / float(C_use)
+            # All per-l contractions as ONE GEMM: W[c, lm, l', k, e] holds the
+            # pref-weighted coefficients, nonzero only where lm lies in block l',
+            # so contracting the coefficient gradient over (c, lm) yields every
+            # per-l product (and the mean over centers) in a single pass over the
+            # multi-hundred-MB gradient tensor.
+            W = torch.zeros((C_use, L, Lp1, S, nmax), device=device, dtype=dtype)
+            for l in range(Lp1):
+                sl = slice(l * l, (l + 1) * (l + 1))
+                pref = self._prefactor_l(l, device, dtype)
+                W[:, sl, l] = (pref * inv_C) * c_use[:, :, :, sl].permute(0, 3, 1, 2)
+            # the contraction wants the gradient as (3, A, S, n, Cu*lm) so the
+            # contracted axes are adjacent for cuBLAS; on the fused stream path
+            # the kernels already wrote that layout (dperm_t), otherwise
+            # transpose into a persistent scratch here
+            if dperm_t is not None:
+                dperm = dperm_t
+            else:
+                dp_key = ("dperm", str(device), str(dtype))
+                dp_shape = (3, n_inc, S, nmax, C_use, L)
+                dperm = self._scratch.get(dp_key)
+                if dperm is None or dperm.shape != dp_shape:
+                    dperm = torch.empty(dp_shape, device=device, dtype=dtype)
+                    self._scratch[dp_key] = dperm
+                dperm.copy_(d_use.permute(2, 1, 3, 4, 0, 5))
+            dperm = dperm.view(3 * n_inc * S * nmax, C_use * L)
+            t1 = (dperm @ W.view(C_use * L, Lp1 * S * nmax)).view(
+                3, n_inc, S, nmax, Lp1, S, nmax
+            ).permute(4, 0, 1, 2, 5, 3, 6)              # (l, 3, A, j, k, n, e)
+            dP = t1 + t1.permute(0, 1, 2, 4, 3, 6, 5)   # swap (j,n) <-> (k,e)
+            for (j, jd, l, is_diag, start, end) in self._feat_slices:
+                blk = dP[l, :, :, j, jd]                # (3, A, n, e)
+                if is_diag:
+                    dglob[:, :, start:end] = blk[:, :, triu_i, triu_j]
+                else:
+                    dglob[:, :, start:end] = blk.reshape(3, n_inc, -1)
+            bcast = dglob[None].expand(n_centers, 3, n_inc, n_feat)
+            if out_view is not None:
+                out_view.copy_(bcast)
+                deriv = out_view
+            else:
+                deriv = bcast.contiguous()
+        else:
+            if self.average == "off" and out_view is not None:
+                # every feature column of every row is written below; no zero-fill needed
+                dfeat = out_view
+            else:
+                dfeat = torch.empty((C_use, 3, n_inc, n_feat), device=device, dtype=dtype)
+            for l in range(Lp1):
+                sl = slice(l * l, (l + 1) * (l + 1))
+                c_l = c_use[:, :, :, sl]          # (Cu, S, n, 2l+1)
+                d_l = d_use[:, :, :, :, :, sl]    # (Cu, A, 3, S, n, 2l+1)
+                pref = self._prefactor_l(l, device, dtype)
+                # dp = pref * sum_m (dc*c' + c*dc'); the second term is the first with
+                # (j,n) <-> (k,e) swapped, so one einsum + a permuted add suffices.
+                # Output is atom-major: (Cu, 3, A, j, k, n, e).
+                t1 = pref * torch.einsum("caxjnm,ckem->cxajkne", d_l, c_l)
+                dP = t1 + t1.permute(0, 1, 2, 4, 3, 6, 5)  # swap (j,n) <-> (k,e)
+
+                for (j, jd, l2, is_diag, start, end) in self._feat_slices:
+                    if l2 != l:
+                        continue
+                    blk = dP[:, :, :, j, jd]               # (Cu, 3, A, n, e)
+                    if is_diag:
+                        dfeat[:, :, :, start:end] = blk[:, :, :, triu_i, triu_j]
+                    else:
+                        dfeat[:, :, :, start:end] = blk.reshape(C_use, 3, n_inc, -1)
+
+            if self.average == "off":
+                deriv = dfeat
+            else:
+                # global descriptor ('inner'): one gradient row, broadcast over
+                # centers to match the autograd output convention.
+                dglob = dfeat[0]
+                bcast = dglob[None].expand(n_centers, 3, n_inc, n_feat)
+                if out_view is not None:
+                    out_view.copy_(bcast)
+                    deriv = out_view
+                else:
+                    deriv = bcast.contiguous()
+
+        desc0 = self._power_spectrum(
+            [c_full[:, :, :, l * l:(l + 1) * (l + 1)] for l in range(Lp1)]
+        ).detach() if return_descriptor else None
         return (deriv, desc0) if return_descriptor else deriv
 
     def derivatives(
