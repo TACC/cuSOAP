@@ -70,8 +70,6 @@ if __name__ == "__main__":
         is_batched = True
         centers_batchsize = int(sys.argv[2])
 
-    print(is_batched)
-
     #output an array in a single line
     np.set_printoptions(linewidth=np.inf)
 

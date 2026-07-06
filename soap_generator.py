@@ -6,9 +6,11 @@ Overview
 --------
 - Match the *functionality* and *feature ordering* of the DScribe SOAP
   (SOAP( r_cut, n_max, l_max, sigma, rbf, weighting, crossover, average, species, periodic, sparse, dtype )).
-- Provide analytical (closed-form / autograd) and numerical derivatives with output shape
-  (n_centers, 3, n_atoms_included, n_features); center-batches concatenate along dim 0 into
-  the full (n_atoms, 3, n_atoms, n_features) Jacobian.
+- Provide analytical (closed-form / autograd) and numerical derivatives. The backends
+  compute (n_centers, 3, n_atoms_included, n_features); SOAP.derivatives returns it with
+  the leading axes flattened to (n_centers * 3, n_atoms_included, n_features), so
+  center-batches concatenate along dim 0 into the full (n_atoms * 3, n_atoms, n_features)
+  Jacobian.
 - Run on **GPU end-to-end** for the heavy parts: spherical harmonics, radial basis evaluation, accumulation, power spectrum.
   (Neighbor list can use torch_cluster on GPU when installed; otherwise a chunked torch.cdist fallback is used.)
 --------
@@ -3068,9 +3070,19 @@ class SOAP:
           - "auto"       : analytical when supported (here: always, since the autograd
                            path is general), else numerical -- mirroring DScribe, which
                            prefers analytical for SOAP.
+
+        The backend Jacobian (n_centers, 3, n_atoms_included, n_features) is
+        returned with the leading (center, component) axes flattened:
+
+            (n_centers * 3, n_atoms_included, n_features)
+
+        so center-batches concatenate along dim 0 into the full
+        (n_atoms * 3, n_atoms, n_features) tensor. The flatten is a zero-copy
+        view (the backends return contiguous tensors), so the persistent-buffer
+        / zero-copy torch.cat fast path is preserved.
         """
         if method == "numerical":
-            return self.derivatives_numerical(
+            res = self.derivatives_numerical(
                 system=system,
                 centers=centers,
                 include=include,
@@ -3082,8 +3094,8 @@ class SOAP:
                 only_physical_cores=only_physical_cores,
                 verbose=verbose,
             )
-        if method in ("auto", "analytical"):
-            return self.derivatives_analytical(
+        elif method in ("auto", "analytical"):
+            res = self.derivatives_analytical(
                 system=system,
                 centers=centers,
                 include=include,
@@ -3091,4 +3103,15 @@ class SOAP:
                 return_descriptor=return_descriptor,
                 attach=attach,
             )
-        raise ValueError("method must be one of: 'auto', 'analytical', 'numerical'.")
+        else:
+            raise ValueError("method must be one of: 'auto', 'analytical', 'numerical'.")
+
+        def _flatten(d: torch.Tensor) -> torch.Tensor:
+            # (C, 3, A, F) -> (C*3, A, F); .reshape is a view for the
+            # contiguous tensors the backends return
+            return d.reshape(d.shape[0] * 3, *d.shape[2:])
+
+        if return_descriptor:
+            deriv, desc = res
+            return _flatten(deriv), desc
+        return _flatten(res)
