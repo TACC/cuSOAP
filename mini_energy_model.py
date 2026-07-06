@@ -94,7 +94,7 @@ def main():
     dsoap_dxyz = pytorch_soap.derivatives(system=molecule, method="analytical", return_descriptor=False) 
     # apply the chain rule to afford atomic forces
     # i.e., denergy_dxyz = denergy_dsoap * dsoap_dxyz
-    forces = (denergy_dsoap * dsoap_dxyz).sum(dim=(1,2),keepdim=True).reshape(natoms,3)
+    forces = -1.0 * (denergy_dsoap * dsoap_dxyz).sum(dim=(1,2),keepdim=True).reshape(natoms,3)
     print("FORCES EVALUATED!")
 
     print("TASK ACCOMPLISEDH!")
