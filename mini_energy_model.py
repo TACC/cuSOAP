@@ -91,7 +91,7 @@ def main():
     # using autograd to get the derivative of energy with respect to the SOAP vetors
     denergy_dsoap = torch.autograd.grad(outputs=energy, inputs=soap_tensors)[0] 
     # calculate the derivative of SOAP vectors with respect to atomic coordinates
-    dsoap_dxyz = pytorch_soap.derivatives(system=molecule, method="analytical", return_descriptor=False) 
+    dsoap_dxyz = pytorch_soap.derivatives(system=molecule, method="analytical", return_descriptor=False).permute(0,2,1,3).flatten(0,1) 
     # apply the chain rule to afford atomic forces
     # i.e., denergy_dxyz = denergy_dsoap * dsoap_dxyz
     forces = -1.0 * (denergy_dsoap * dsoap_dxyz).sum(dim=(1,2),keepdim=True).reshape(natoms,3)
