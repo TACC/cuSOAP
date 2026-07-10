@@ -18,8 +18,8 @@ l_max = 3
 periodic = False
 #average = "off", "inner", "outer" or "cc"
 average = "outer"
-#rgb = "gto" or "polynomial"
-rgb = "gto"
+#rbf = "gto" or "polynomial"
+rbf = "gto"
 
 # Setting up the pytorch_based SOAP descriptor
 pytorch_soap = PYTORCH_SOAP(
@@ -29,7 +29,7 @@ pytorch_soap = PYTORCH_SOAP(
     n_max=n_max,
     l_max=l_max,
     average=average,
-    rgb = rgb
+    rbf = rbf
 )
 
 # Molecule created as an ASE.Atoms
