@@ -27,6 +27,197 @@ import math
 import time
 import torch
 
+try:
+    import os as _os
+
+    # Triton's bundled ptxas may not know very new GPU targets (e.g. the GB10's
+    # sm_121a); prefer the system CUDA toolkit ptxas when one is installed.
+    if "TRITON_PTXAS_PATH" not in _os.environ:
+        for _p in ("/usr/local/cuda/bin/ptxas", "/usr/local/cuda-13.0/bin/ptxas"):
+            if _os.path.exists(_p):
+                _os.environ["TRITON_PTXAS_PATH"] = _p
+                break
+
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except Exception:
+    _HAS_TRITON = False
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _cc_jacobian_dense_kernel(
+        rvec_ptr,      # (E,3) f64
+        B_ptr,         # (E,NMAX,LP1) f64 radial values
+        Bhat_ptr,      # (E,NMAX,LP1) f64 radial -2*gamma values
+        Yval_ptr,      # (E,LSQ) f64 solid harmonics
+        Ygrad_ptr,     # (E,3,LSQ) f64 solid-harmonic Cartesian gradients
+        emap_ptr,      # (C*n_inc,) i64 edge id for each (center, atom) pair, -1 = no edge
+        sp_ptr,        # (E,) i64 neighbor species
+        lm_src_ptr,    # (LSQ,) i32 source lm for each output lm (DScribe cc order)
+        l_of_lm_ptr,   # (LSQ,) i32 degree l of each output lm
+        scale_ptr,     # (LSQ,) f64 DScribe cc scale per output lm
+        out_ptr,       # (C,n_inc,3,n_feat) f32, uninitialized (fully written here)
+        n_feat,
+        NMAX: tl.constexpr,
+        LP1: tl.constexpr,
+        LSQ: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # One (center, atom) pair per pid0. Pairs map to at most one edge
+        # (single-image, non-periodic radius search), so every output slot is
+        # written by exactly one program: plain stores, no atomics, and no
+        # separate zero-initialization pass. For pairs beyond the cutoff (or
+        # in the wrong species block) zero is stored; otherwise
+        #   d c_{s n lm}/d x_{a,d} =
+        #     (rvec_d * Bhat_{n,l} * Y_{lm} + B_{n,l} * gradY_{d,lm}) * scale_lm
+        # computed in float64 and stored as float32.
+        ca = tl.program_id(0).to(tl.int64)
+        e = tl.load(emap_ptr + ca)
+        active = e >= 0
+        e0 = tl.maximum(e, 0)
+        s = tl.load(sp_ptr + e0, mask=active, other=0)
+
+        offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        inb = offs < 3 * n_feat
+        d = offs // n_feat
+        rem = offs % n_feat
+        sblk = rem // (NMAX * LSQ)
+        rem2 = rem % (NMAX * LSQ)
+        n = rem2 // LSQ
+        lm = rem2 % LSQ
+
+        msel = inb & active & (sblk == s)
+
+        lms = tl.load(lm_src_ptr + lm, mask=inb, other=0)
+        l = tl.load(l_of_lm_ptr + lm, mask=inb, other=0)
+        sc = tl.load(scale_ptr + lm, mask=inb, other=0.0)
+
+        rv = tl.load(rvec_ptr + e0 * 3 + d, mask=msel, other=0.0)
+        Bv = tl.load(B_ptr + (e0 * NMAX + n) * LP1 + l, mask=msel, other=0.0)
+        Bh = tl.load(Bhat_ptr + (e0 * NMAX + n) * LP1 + l, mask=msel, other=0.0)
+        Yv = tl.load(Yval_ptr + e0 * LSQ + lms, mask=msel, other=0.0)
+        Yg = tl.load(Ygrad_ptr + (e0 * 3 + d) * LSQ + lms, mask=msel, other=0.0)
+
+        val = tl.where(msel, (rv * Bh * Yv + Bv * Yg) * sc, 0.0)
+        tl.store(out_ptr + ca * 3 * n_feat + offs, val.to(tl.float32), mask=inb)
+
+    @triton.jit
+    def _ps_uv_kernel(
+        Yval_ptr,      # (E,LSQ) f64 solid harmonics
+        Ygrad_ptr,     # (E,3,LSQ) f64 solid-harmonic Cartesian gradients
+        C_ptr,         # (C,S*NMAX,LSQ) f64 per-center coefficients c_{kq,lm}
+        cidx_ptr,      # (E,) i64 center index of each edge
+        U_ptr,         # (E,S*NMAX,LP1) f64 out: U[e,kq,l]   = sum_m Y_lm c_{kq,lm}
+        V_ptr,         # (E,3,S*NMAX,LP1) f64 out: V[e,d,kq,l] = sum_m gradY_{d,lm} c_{kq,lm}
+        NMAX: tl.constexpr,
+        LP1: tl.constexpr,
+        LSQ: tl.constexpr,
+        S: tl.constexpr,
+        M: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # One edge per program: contract the edge's solid harmonics (values and
+        # gradients) with its center's coefficients over m for every (kq, l).
+        e = tl.program_id(0).to(tl.int64)
+        c = tl.load(cidx_ptr + e)
+        t = tl.arange(0, BLOCK)
+        inb = t < S * NMAX * LP1
+        kq = t // LP1
+        l = t % LP1
+        m = tl.arange(0, M)
+        mm = inb[:, None] & (m[None, :] < (2 * l + 1)[:, None])
+        lm = (l * l)[:, None] + m[None, :]
+        Cv = tl.load(C_ptr + (c * S * NMAX + kq)[:, None] * LSQ + lm, mask=mm, other=0.0)
+        Yv = tl.load(Yval_ptr + e * LSQ + lm, mask=mm, other=0.0)
+        tl.store(U_ptr + e * (S * NMAX * LP1) + t, tl.sum(Cv * Yv, axis=1), mask=inb)
+        for d in tl.static_range(3):
+            Yg = tl.load(Ygrad_ptr + (e * 3 + d) * LSQ + lm, mask=mm, other=0.0)
+            tl.store(V_ptr + (e * 3 + d) * (S * NMAX * LP1) + t, tl.sum(Cv * Yg, axis=1), mask=inb)
+
+    @triton.jit
+    def _ps_jacobian_dense_kernel(
+        rvec_ptr,      # (E,3) f64
+        B_ptr,         # (E,NMAX,LP1) f64 radial values
+        Bhat_ptr,      # (E,NMAX,LP1) f64 radial -2*gamma values
+        U_ptr,         # (E,S*NMAX,LP1) f64  U[e,kq,l]   = sum_m Y_lm(e) c_{kq,lm}
+        V_ptr,         # (E,3,S*NMAX,LP1) f64 V[e,d,kq,l] = sum_m gradY_{d,lm}(e) c_{kq,lm}
+        emap_ptr,      # (C*n_inc,) i64 edge id for each (center, atom) pair, -1 = no edge
+        sp_ptr,        # (E,) i64 neighbor species
+        fj_ptr,        # (n_feat,) i32 first species j of the feature
+        fjd_ptr,       # (n_feat,) i32 second species j' of the feature
+        fn_ptr,        # (n_feat,) i32 first radial index n of the feature
+        fnd_ptr,       # (n_feat,) i32 second radial index n' of the feature
+        fl_ptr,        # (n_feat,) i32 degree l of the feature
+        fpref_ptr,     # (n_feat,) f64 sqrt(8 pi^2 / (2l+1))
+        out_ptr,       # (C,n_inc,3,n_feat) f32, uninitialized (fully written here)
+        n_feat,
+        n_inc,
+        n_blk,         # number of BLOCK-sized feature blocks per (center, atom) pair
+        NMAX: tl.constexpr,
+        LP1: tl.constexpr,
+        S: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # Power-spectrum Jacobian, one (center, atom) pair per pid0. With at
+        # most one edge per pair (single-image, non-periodic radius search) the
+        # scattered coefficient gradient collapses to the edge gradient
+        #   g[d,n,lm] = rvec_d * Bhat_{n,l} * Y_lm + B_{n,l} * gradY_{d,lm}
+        # in the species block of the neighbor only, so the product rule
+        #   d p_{j n, j' n', l} / d x_{a,d} = pref_l * sum_m (
+        #         delta_{j,s}  g[d,n,lm]  * c_{j' n' lm}
+        #       + delta_{j',s} g[d,n',lm] * c_{j n lm} )
+        # collapses, after distributing g over the precomputed per-edge
+        # contractions U = sum_m Y c and V = sum_m gradY c, to two fused
+        # multiply-adds per term:
+        #   delta_{j,s} * (rvec_d Bhat_n U[j'n'] + B_n V[d,j'n'])  + (n <-> n')
+        # -- no per-m loop in the kernel at all. Everything is float64 and
+        # stored once as float32: no edge-gradient tensor, no scatter buffer,
+        # no per-l einsum intermediates, no zero-init memset.
+        #
+        # 1D pair-major grid: the n_blk feature blocks of one pair are
+        # launch-adjacent, so the pair's B/Bhat/U/V rows are read from cache
+        # instead of n_blk times from DRAM.
+        pid = tl.program_id(0).to(tl.int64)
+        ca = pid // n_blk
+        offs = (pid % n_blk) * BLOCK + tl.arange(0, BLOCK)
+        inb = offs < 3 * n_feat
+        e = tl.load(emap_ptr + ca)
+        if e < 0:
+            tl.store(out_ptr + ca * 3 * n_feat + offs,
+                     tl.zeros((BLOCK,), dtype=tl.float32), mask=inb)
+            return
+        s = tl.load(sp_ptr + e)
+
+        d = offs // n_feat
+        f = offs % n_feat
+        j = tl.load(fj_ptr + f, mask=inb, other=0)
+        jd = tl.load(fjd_ptr + f, mask=inb, other=0)
+        n = tl.load(fn_ptr + f, mask=inb, other=0)
+        nd = tl.load(fnd_ptr + f, mask=inb, other=0)
+        l = tl.load(fl_ptr + f, mask=inb, other=0)
+        pref = tl.load(fpref_ptr + f, mask=inb, other=0.0)
+
+        t1 = inb & (j == s)    # dc lives in species block j
+        t2 = inb & (jd == s)   # dc lives in species block j'
+
+        rv = tl.load(rvec_ptr + e * 3 + d, mask=inb, other=0.0)
+        idx1 = j * NMAX + n
+        idx2 = jd * NMAX + nd
+        # masked loads return 0, which zeroes the whole term: no tl.where
+        Bv_n = tl.load(B_ptr + (e * NMAX + n) * LP1 + l, mask=t1, other=0.0)
+        Bh_n = tl.load(Bhat_ptr + (e * NMAX + n) * LP1 + l, mask=t1, other=0.0)
+        U2 = tl.load(U_ptr + (e * S * NMAX + idx2) * LP1 + l, mask=t1, other=0.0)
+        V2 = tl.load(V_ptr + ((e * 3 + d) * S * NMAX + idx2) * LP1 + l, mask=t1, other=0.0)
+        Bv_nd = tl.load(B_ptr + (e * NMAX + nd) * LP1 + l, mask=t2, other=0.0)
+        Bh_nd = tl.load(Bhat_ptr + (e * NMAX + nd) * LP1 + l, mask=t2, other=0.0)
+        U1 = tl.load(U_ptr + (e * S * NMAX + idx1) * LP1 + l, mask=t2, other=0.0)
+        V1 = tl.load(V_ptr + ((e * 3 + d) * S * NMAX + idx1) * LP1 + l, mask=t2, other=0.0)
+
+        val = pref * ((rv * Bh_n * U2 + Bv_n * V2) + (rv * Bh_nd * U1 + Bv_nd * V1))
+        tl.store(out_ptr + ca * 3 * n_feat + offs, val.to(tl.float32), mask=inb)
 
 
 # -----------------------------
@@ -291,23 +482,30 @@ def _i0e(t: torch.Tensor) -> torch.Tensor:
 
 
 def _i1e(t: torch.Tensor) -> torch.Tensor:
+    # i_1(t) e^{-t} = e^{-t} (cosh t / t - sinh t / t^2)
     eps = 1e-12
     tt = torch.clamp(t, min=eps)
     e2 = torch.exp(-2 * tt)
-    return (1 - e2) / (2 * tt * tt) - (1 + e2) / (2 * tt)
+    return (1 + e2) / (2 * tt) - (1 - e2) / (2 * tt * tt)
 
 
 def modified_spherical_bessel_ie(l_max: int, t: torch.Tensor) -> torch.Tensor:
+    # Upward recurrence i_{l+1} = i_{l-1} - (2l+1)/t i_l, out-of-place so the
+    # autograd derivative path can differentiate through it. i_l(t) is positive
+    # and strictly decreasing in l, so clamping each level into [0, i_{l-1}]
+    # suppresses the small-t cancellation noise of the upward recurrence
+    # without touching well-conditioned values.
     eps = 1e-12
     tt = torch.clamp(t, min=eps)
-    out = torch.zeros((l_max + 1,) + tt.shape, device=tt.device, dtype=tt.dtype)
-    out[0] = _i0e(tt)
+    outs = [_i0e(tt)]
     if l_max == 0:
-        return out
-    out[1] = _i1e(tt)
+        return torch.stack(outs, dim=0)
+    outs.append(torch.clamp(_i1e(tt), min=0.0))
     for l in range(1, l_max):
-        out[l + 1] = out[l - 1] - (2 * l + 1) / tt * out[l]
-    return out
+        nxt = outs[l - 1] - (2 * l + 1) / tt * outs[l]
+        nxt = torch.minimum(torch.clamp(nxt, min=0.0), outs[l])
+        outs.append(nxt)
+    return torch.stack(outs, dim=0)
 
 
 # ----------------------------
@@ -449,12 +647,23 @@ class SOAP:
                 dummy["pbc"] = torch.tensor([True, True, True], device=self.device, dtype=torch.bool)
             self.create(dummy)
             if (
-                self._rbf == "gto"
+                self._rbf in ("gto", "polynomial")
                 and not self.periodic
                 and self._weighting is None
                 and self.average in ("off", "outer", "cc", "inner")
             ):
                 self.derivatives_analytical_ps(dummy, return_descriptor=False)
+            # Pre-warm the CUDA caching allocator: allocate and free one large
+            # block so the first real call's big output tensors are served by
+            # splitting this cached block instead of a fresh cudaMalloc
+            # (~30 ms/GB on GB10). 2560 MB covers the (C,A,3,n_feat) float32
+            # power-spectrum Jacobian plus its U/V workspaces for the 300-atom
+            # test case. Override with SOAP_CUDA_POOL_MB (0 disables).
+            import os
+            pool_mb = int(os.environ.get("SOAP_CUDA_POOL_MB", "2560"))
+            if pool_mb > 0:
+                buf = torch.empty(pool_mb * 1024 * 1024, device=self.device, dtype=torch.uint8)
+                del buf
             torch.cuda.synchronize()
         except Exception:
             # Warmup is best-effort; never fail construction because of it.
@@ -499,16 +708,42 @@ class SOAP:
         self._betas = torch.stack(betas, dim=0)    # (l_max+1, n_max, n_max)
 
     def _init_poly_basis(self):
+        """
+        Polynomial radial basis g_n(r) = sum_k beta_nk (r_cut - r)^{k+2},
+        Loewdin-orthonormalized, evaluated on the 100-point Gauss-Legendre
+        grid — a faithful replica of DScribe's SOAP.get_basis_poly.
+
+        The overlap matrix S (entries ~ r_cut^{7+i+j}) is severely
+        ill-conditioned, so the numerically dominated directions of S^{-1/2}
+        depend on the algorithm used. DScribe computes
+        scipy.linalg.sqrtm(numpy.linalg.inv(S)) in float64 on the CPU; to
+        reproduce DScribe's descriptor we must use the exact same computation
+        (the torch eigh-based _lowdin_invsqrt disagrees at the percent level
+        for n_max >~ 5). Falls back to _lowdin_invsqrt if SciPy is missing.
+        """
         device = self.device
         dtype = torch.float64
         n = self._n_max
-        rc = torch.tensor(self._r_cut, device=device, dtype=dtype)
+        rc = self._r_cut
 
-        S = torch.zeros((n, n), device=device, dtype=dtype)
+        import numpy as np
+        S_np = np.zeros((n, n), dtype=np.float64)
         for i in range(1, n + 1):
             for j in range(1, n + 1):
-                S[i - 1, j - 1] = (2.0 * (rc ** (7 + i + j))) / ((5 + i + j) * (6 + i + j) * (7 + i + j))
-        betas = _lowdin_invsqrt(S)
+                S_np[i - 1, j - 1] = (2 * rc ** (7 + i + j)) / ((5 + i + j) * (6 + i + j) * (7 + i + j))
+        try:
+            from scipy.linalg import sqrtm
+            betas_np = sqrtm(np.linalg.inv(S_np))
+            if betas_np.dtype == np.complex128:
+                raise ValueError(
+                    "Could not calculate normalization factors for the radial "
+                    "basis in the domain of real numbers. Lowering the number of "
+                    "radial basis functions (n_max) or increasing the radial "
+                    "cutoff (r_cut) is advised."
+                )
+            betas = torch.from_numpy(np.ascontiguousarray(betas_np)).to(device=device, dtype=dtype)
+        except ImportError:
+            betas = _lowdin_invsqrt(torch.from_numpy(S_np).to(device=device, dtype=dtype))
 
         x, w = gauss_legendre(self.quad_n, device=device, dtype=dtype)
         rx = self._r_cut * 0.5 * (x + 1.0)
@@ -963,16 +1198,16 @@ class SOAP:
             return cached
 
         out: Dict[str, torch.Tensor] = {}
-        out["alphas"] = self._alphas.to(device=device, dtype=dtype)
-        out["betas"]  = self._betas.to(device=device, dtype=dtype)
-        out["eta"]    = torch.tensor(self._eta, device=device, dtype=dtype)
-        # Polynomial backend constants (if initialized)
+        # GTO basis constants (only when rbf='gto')
+        if hasattr(self, "_alphas"):
+            out["alphas"] = self._alphas.to(device=device, dtype=dtype)
+            out["betas"]  = self._betas.to(device=device, dtype=dtype)
+        out["eta"] = torch.tensor(self._eta, device=device, dtype=dtype)
+        # Polynomial backend constants (only when rbf='polynomial')
         if hasattr(self, "_rx"):
             out["rx"] = self._rx.to(device=device, dtype=dtype)
-        if hasattr(self, "_ws"):
-            out["ws"] = self._ws.to(device=device, dtype=dtype)
-        if hasattr(self, "_B"):
-            out["B"]  = self._B.to(device=device, dtype=dtype)
+            out["wr"] = self._wr.to(device=device, dtype=dtype)
+            out["gss"] = self._gss.to(device=device, dtype=dtype)
 
         self._const_cache[key] = out
         return out
@@ -1008,6 +1243,52 @@ class SOAP:
         self._feat_slices = slices
         if off != self._n_power_features():
             raise RuntimeError(f"Feature slice size mismatch: built={off}, expected={self._n_power_features()}")
+
+    def _ps_feat_tables(self, device: torch.device):
+        """
+        Per-feature lookup tables for the Triton power-spectrum Jacobian
+        kernel: feature f -> (j, j', n, n', l, pref_l) in the exact DScribe
+        ordering of _build_feature_slices (diagonal species blocks walk the
+        row-major upper triangle of (n_max x n_max), matching triu_indices).
+        Cached on the instance per device.
+        """
+        cache = getattr(self, "_ps_feat_cache", None)
+        if cache is not None and cache[0] == str(device):
+            return cache[1]
+        if self._feat_slices is None:
+            self._build_feature_slices()
+        nmax = self._n_max
+        fj: List[int] = []
+        fjd: List[int] = []
+        fn: List[int] = []
+        fnd: List[int] = []
+        fl: List[int] = []
+        fpref: List[float] = []
+        for (j, jd, l, is_diag, start, end) in self._feat_slices:
+            pref = math.sqrt(8.0 * math.pi * math.pi / (2 * l + 1))
+            if is_diag:
+                pairs = [(a, b) for a in range(nmax) for b in range(a, nmax)]
+            else:
+                pairs = [(a, b) for a in range(nmax) for b in range(nmax)]
+            for (a, b) in pairs:
+                fj.append(j)
+                fjd.append(jd)
+                fn.append(a)
+                fnd.append(b)
+                fl.append(l)
+                fpref.append(pref)
+        if len(fj) != self._n_power_features():
+            raise RuntimeError("Feature table size mismatch in _ps_feat_tables.")
+        tables = (
+            torch.tensor(fj, device=device, dtype=torch.int32),
+            torch.tensor(fjd, device=device, dtype=torch.int32),
+            torch.tensor(fn, device=device, dtype=torch.int32),
+            torch.tensor(fnd, device=device, dtype=torch.int32),
+            torch.tensor(fl, device=device, dtype=torch.int32),
+            torch.tensor(fpref, device=device, dtype=torch.float64),
+        )
+        self._ps_feat_cache = (str(device), tables)
+        return tables
 
 
     def _coefficients_gto(
@@ -1132,18 +1413,7 @@ class SOAP:
         Y_all = self._Y.compute(unit)
         wj = self._weights(r)
 
-        rx = self._rx.to(device=device, dtype=dtype)        # (Q,)
-        wr = self._wr.to(device=device, dtype=dtype)        # (Q,)
-        gss = self._gss.to(device=device, dtype=dtype)      # (n_max,Q)
-        eta = torch.tensor(self._eta, device=device, dtype=dtype)
-
-        rx2 = rx * rx
-        rj = r
-        t = 2 * eta * (rx[None, :] * rj[:, None])           # (E,Q)
-        ie = modified_spherical_bessel_ie(self._l_max, t)   # (l_max+1,E,Q)
-
-        gauss = torch.exp(-eta * (rx[None, :] - rj[:, None]) ** 2)   # (E,Q)
-        common = (4.0 * math.pi) * (rx2[None, :] * gauss) * wr[None, :]  # (E,Q)
+        I, _ = self._poly_I_J(r, want_J=False)              # (E,n_max,l_max+1)
 
         idx0 = center_index * self.n_species + neigh_species
         n_rows = n_centers * self.n_species
@@ -1154,10 +1424,7 @@ class SOAP:
             end = (l + 1) * (l + 1)
             Y = Y_all[:, start:end]  # (E,2l+1)
 
-            F = common * ie[l]       # (E,Q)
-            I = F @ gss.transpose(0, 1)   # (E,n_max)
-
-            prim = wj[:, None] * I
+            prim = wj[:, None] * I[:, :, l]
             contrib = prim[:, :, None] * Y[:, None, :]
             contrib_flat = contrib.reshape(contrib.shape[0], -1)
             acc_flat = torch.zeros((n_rows, contrib_flat.shape[1]), device=device, dtype=dtype)
@@ -1166,6 +1433,166 @@ class SOAP:
             out.append(acc)
 
         return out
+
+    def _poly_I_J(self, r: torch.Tensor, want_J: bool) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Radial density-projection integrals of the polynomial basis on the
+        DScribe Gauss-Legendre grid, for all n and l at once
+        (ie_l(t) = i_l(t) e^{-t}, t = 2 eta rx r):
+
+            I[e,n,l] = 4 pi int rx^2 g_n(rx) e^{-eta (rx-r_e)^2} ie_l(t) drx
+            J[e,n,l] = 4 pi int rx^3 g_n(rx) e^{-eta (rx-r_e)^2} ie_{l+1}(t) drx
+
+        The Bessel recurrence runs directly on P_l = common * ie_l (the
+        positive l-independent common factor commutes with the linear
+        recurrence and with the [0, P_{l-1}] stability clamp), and each P_l
+        slab is read by a single GEMM against the combined weights
+        [gss | gss*rx], which keeps the f64 memory traffic minimal (GB10 f64
+        ALU/exp is ~1/64 rate, so this path is bandwidth/launch bound).
+        Fully differentiable — the autograd fallback path goes through here
+        via _coefficients_polynomial.
+        """
+        device = r.device
+        dtype = r.dtype
+        nmax = self._n_max
+        Lp1 = self._l_max + 1
+        E = int(r.numel())
+        rx = self._rx.to(device=device, dtype=dtype)        # (Q,)
+        wr = self._wr.to(device=device, dtype=dtype)        # (Q,)
+        gssT = self._gss.to(device=device, dtype=dtype).transpose(0, 1)  # (Q,n)
+        eta = self._eta
+        Q = int(rx.numel())
+
+        if want_J:
+            W = torch.cat([gssT, gssT * rx[:, None]], dim=1).contiguous()  # (Q,2n)
+        else:
+            W = gssT.contiguous()
+
+        I = torch.empty((E, nmax, Lp1), device=device, dtype=dtype)
+        J = torch.empty((E, nmax, Lp1), device=device, dtype=dtype) if want_J else None
+        L_top = Lp1 if want_J else Lp1 - 1   # highest ie level needed
+
+        rxw = rx * rx * wr                                   # (Q,)
+        chunk = max(1, (1 << 23) // max(Q, 1))
+        for e0 in range(0, E, chunk):
+            e1 = min(e0 + chunk, E)
+            re_ = r[e0:e1]
+            tt = torch.clamp((2.0 * eta) * rx[None, :] * re_[:, None], min=1e-12)  # (e,Q)
+            e2 = torch.exp(-2.0 * tt)
+            oOt = 1.0 / tt
+            common = (4.0 * math.pi) * rxw[None, :] * torch.exp(
+                -eta * (rx[None, :] - re_[:, None]) ** 2
+            )                                                                       # (e,Q)
+            P_pp: Optional[torch.Tensor] = None
+            P_p: Optional[torch.Tensor] = None
+            for l in range(L_top + 1):
+                if l == 0:
+                    P = common * ((1.0 - e2) * (0.5 * oOt))                         # common*ie_0
+                elif l == 1:
+                    ie1 = torch.clamp(
+                        (1.0 + e2) * (0.5 * oOt) - (1.0 - e2) * (0.5 * oOt * oOt), min=0.0
+                    )
+                    P = common * ie1
+                else:
+                    P = torch.minimum(
+                        torch.clamp(P_pp - (2 * l - 1) * oOt * P_p, min=0.0), P_p
+                    )
+                out = P @ W                                                          # (e, n or 2n)
+                if l < Lp1:
+                    I[e0:e1, :, l] = out[:, :nmax]
+                if want_J and l >= 1:
+                    J[e0:e1, :, l - 1] = out[:, nmax:]
+                P_pp, P_p = P_p, P
+
+        return I, J
+
+    def _poly_B_Bhat_r0(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Exact r->0 limits of the polynomial radial factors B_nl = I_nl(r)/r^l
+        and Bhat_nl = (1/r) d/dr B_nl, from i_l(t) ~ t^l/(2l+1)!!:
+
+            B0_nl    = 4 pi int rx^2 g_n e^{-eta rx^2} (2 eta rx)^l / (2l+1)!! drx
+            Bhat0_nl = 2 eta * 4 pi int rx^2 g_n e^{-eta rx^2} (2 eta rx)^l
+                       * [ 2 eta rx^2 / (2l+3)!! - 1 / (2l+1)!! ] drx
+
+        Used for the r~0 self edges kept in the closed-form derivative edge
+        list. Cached on the instance (float64).
+        """
+        cached = getattr(self, "_poly_r0_cache", None)
+        if cached is not None:
+            return cached
+        device = self.device
+        dtype = torch.float64
+        rx = self._rx.to(device=device, dtype=dtype)
+        wr = self._wr.to(device=device, dtype=dtype)
+        gssT = self._gss.to(device=device, dtype=dtype).transpose(0, 1)  # (Q,n)
+        eta = self._eta
+        nmax = self._n_max
+        Lp1 = self._l_max + 1
+        common0 = (4.0 * math.pi) * rx * rx * wr * torch.exp(-eta * rx * rx)  # (Q,)
+        B0 = torch.empty((nmax, Lp1), device=device, dtype=dtype)
+        Bhat0 = torch.empty((nmax, Lp1), device=device, dtype=dtype)
+        fl = torch.ones_like(rx)   # (2 eta rx)^l
+        df = 1.0                   # (2l+1)!!
+        for l in range(Lp1):
+            df_next = df * (2 * l + 3)
+            B0[:, l] = (common0 * fl / df) @ gssT
+            Bhat0[:, l] = (2.0 * eta) * (
+                (common0 * fl * (2.0 * eta) * rx * rx / df_next) @ gssT - B0[:, l]
+            )
+            fl = fl * (2.0 * eta) * rx
+            df = df_next
+        self._poly_r0_cache = (B0, Bhat0)
+        return B0, Bhat0
+
+    def _poly_B_Bhat(self, r: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Polynomial-basis radial factors of the solid-harmonic factorization
+        used by the closed-form derivative (weighting=None):
+
+            c_nlm(edge)      = B[e,n,l] * Y_solid,lm(rvec)
+            d B / d rvec_d   = rvec_d * Bhat[e,n,l]
+
+        With the density-projection integral (ie_l(t) = i_l(t) e^{-t}):
+
+            I_nl(r) = 4 pi int rx^2 g_n(rx) e^{-eta (rx-r)^2} ie_l(2 eta rx r) drx
+            J_nl(r) = 4 pi int rx^3 g_n(rx) e^{-eta (rx-r)^2} ie_{l+1}(2 eta rx r) drx
+
+        the identity i_l'(t) = i_{l+1}(t) + (l/t) i_l(t) collapses the quotient
+        rule to
+
+            B_nl    = I_nl / r^l
+            Bhat_nl = 2 eta (J_nl - r I_nl) / r^{l+1}.
+
+        Both limits are finite at r=0; edges with r < 1e-4 (the kept r~0 self
+        edges) are overridden with the exact limits from _poly_B_Bhat_r0.
+        """
+        device = r.device
+        dtype = r.dtype
+        Lp1 = self._l_max + 1
+        eta = self._eta
+
+        tiny = r < 1e-4
+        # placeholder radius for the tiny edges (their rows are overwritten
+        # below with the exact limits; this just keeps the quadrature finite)
+        rs = torch.where(tiny, torch.ones_like(r), r)
+
+        I, J = self._poly_I_J(rs, want_J=True)               # (E,n,Lp1) each
+
+        # r^l per edge and l: cumprod of [1, r, r, ...] along l
+        rl = torch.cumprod(
+            torch.cat([torch.ones_like(rs)[:, None], rs[:, None].expand(-1, Lp1 - 1)], dim=1)
+            if Lp1 > 1 else torch.ones_like(rs)[:, None],
+            dim=1,
+        )                                                     # (E,Lp1)
+        B = I / rl[:, None, :]
+        Bhat = (2.0 * eta) * (J - rs[:, None, None] * I) / (rl * rs[:, None])[:, None, :]
+
+        if bool(tiny.any()):
+            B0, Bhat0 = self._poly_B_Bhat_r0()
+            B[tiny] = B0.to(device=device, dtype=dtype)
+            Bhat[tiny] = Bhat0.to(device=device, dtype=dtype)
+        return B, Bhat
 
     # ---- output assembly ----
 
@@ -1887,13 +2314,17 @@ class SOAP:
         n_max=10 / l_max=5 test case this is ~10 ms instead of ~190 s, using a
         few tens of MB instead of gigabytes.
 
-        Restricted to rbf='gto', non-periodic, weighting=None; the general
-        autograd path (derivatives_analytical) covers everything else.
+        Supports rbf='gto' (closed-form radial factors) and rbf='polynomial'
+        (radial factors by Gauss-Legendre quadrature, see _poly_B_Bhat); both
+        share the same solid-harmonic factorization c_nlm = B_nl(r) *
+        Y_solid,lm(rvec) and everything downstream of B/Bhat. Restricted to
+        non-periodic, weighting=None; the general autograd path
+        (derivatives_analytical) covers everything else.
 
         Output: (n_centers, n_atoms_included, 3, n_features), DScribe convention.
         """
-        if self._rbf != "gto":
-            raise NotImplementedError("closed-form ps derivative needs rbf='gto'; use derivatives_analytical.")
+        if self._rbf not in ("gto", "polynomial"):
+            raise NotImplementedError("closed-form ps derivative needs rbf='gto' or 'polynomial'; use derivatives_analytical.")
         if self.periodic:
             raise NotImplementedError("closed-form ps derivative is non-periodic; use derivatives_analytical.")
         if self._weighting is not None:
@@ -1942,9 +2373,8 @@ class SOAP:
         center_idx, neigh_idx = self._radius_edges(centers_xyz, positions, self._cutoff)
         E = int(center_idx.numel())
 
-        deriv = torch.zeros((n_rows, n_inc, 3, n_feat), device=device, dtype=dtype)
         if E == 0:
-            deriv = deriv.to(out_dtype)
+            deriv = torch.zeros((n_rows, n_inc, 3, n_feat), device=device, dtype=out_dtype)
             if return_descriptor:
                 return deriv, self.create(system, centers)
             return deriv
@@ -1954,41 +2384,181 @@ class SOAP:
         neigh_sp = self._map_Z_to_species(Z[neigh_idx])         # (E,)
 
         const = self._get_const(device, dtype)
-        alphas = const["alphas"]   # (Lp1, nmax)
-        betas = const["betas"]     # (Lp1, nmax, nmax)
         eta = const["eta"]
 
-        # radial factors, all l at once:
-        #   B[e,n,l]    = sum_k beta^l_{nk} pref_kl e^{-gamma_kl r^2}
-        #   Bhat[e,n,l] = sum_k beta^l_{nk} (-2 gamma_kl) pref_kl e^{-gamma_kl r^2}
-        p = alphas + eta                     # (Lp1,nmax)
-        gamma = alphas * eta / p             # (Lp1,nmax)
-        lvec = torch.arange(Lp1, device=device, dtype=dtype)
-        pref = (math.pi ** 1.5) * (eta / p) ** lvec[:, None] * p ** (-1.5)     # (Lp1,nmax)
-        Q = pref[None, :, :] * torch.exp(-gamma[None, :, :] * r2[:, None, None])  # (E,Lp1,nmax)
-        B = torch.einsum("elk,lnk->enl", Q, betas)                              # (E,nmax,Lp1)
-        Bhat = torch.einsum("elk,lnk->enl", (-2.0 * gamma[None, :, :]) * Q, betas)
+        if self._rbf == "gto":
+            alphas = const["alphas"]   # (Lp1, nmax)
+            betas = const["betas"]     # (Lp1, nmax, nmax)
+
+            # radial factors, all l at once:
+            #   B[e,n,l]    = sum_k beta^l_{nk} pref_kl e^{-gamma_kl r^2}
+            #   Bhat[e,n,l] = sum_k beta^l_{nk} (-2 gamma_kl) pref_kl e^{-gamma_kl r^2}
+            p = alphas + eta                     # (Lp1,nmax)
+            gamma = alphas * eta / p             # (Lp1,nmax)
+            lvec = torch.arange(Lp1, device=device, dtype=dtype)
+            pref = (math.pi ** 1.5) * (eta / p) ** lvec[:, None] * p ** (-1.5)     # (Lp1,nmax)
+            Q = pref[None, :, :] * torch.exp(-gamma[None, :, :] * r2[:, None, None])  # (E,Lp1,nmax)
+            B = torch.einsum("elk,lnk->enl", Q, betas)                              # (E,nmax,Lp1)
+            Bhat = torch.einsum("elk,lnk->enl", (-2.0 * gamma[None, :, :]) * Q, betas)
+        else:
+            # polynomial radial factors by quadrature (exact r~0 self-edge limits)
+            B, Bhat = self._poly_B_Bhat(torch.sqrt(r2))
 
         l_of_lm = torch.tensor(
             [l for l in range(Lp1) for _ in range(2 * l + 1)], device=device, dtype=torch.long
         )
-        B_lm = B[:, :, l_of_lm]        # (E,nmax,L)
-        Bhat_lm = Bhat[:, :, l_of_lm]  # (E,nmax,L)
 
         # real solid harmonics r^l Y_lm and exact Cartesian gradients
         Yval, Ygrad = self._Ysolid.compute_with_gradients(rvec)   # (E,L), (E,3,L)
 
         # forward coefficients c[c,s,n,lm] from the SAME edges: the r=0 self
         # edge contributes exactly the analytic l=0 self term (Y_solid,00 = y00).
-        cE = B_lm * Yval[:, None, :]                              # (E,nmax,L)
-        Cacc = torch.zeros((n_centers * S, nmax * L), device=device, dtype=dtype)
-        Cacc.index_add_(0, center_idx * S + neigh_sp, cE.reshape(E, -1))
-        Cc = Cacc.view(n_centers, S, nmax, L)
+        # The cc Jacobian does not involve them, so skip when only derivatives
+        # are requested for 'cc'.
+        need_coeffs = return_descriptor or self.average != "cc"
+        if need_coeffs:
+            cE = B[:, :, l_of_lm] * Yval[:, None, :]              # (E,nmax,L)
+            Cacc = torch.zeros((n_centers * S, nmax * L), device=device, dtype=dtype)
+            Cacc.index_add_(0, center_idx * S + neigh_sp, cE.reshape(E, -1))
+            Cc = Cacc.view(n_centers, S, nmax, L)
 
-        # Center-wise for every mode: the product rule below acts on each
-        # center's own coefficients ('inner' over a single center is the
-        # identity, so no averaging is applied).
-        Cp = Cc
+            # Center-wise for every mode: the product rule below acts on each
+            # center's own coefficients ('inner' over a single center is the
+            # identity, so no averaging is applied).
+            Cp = Cc
+
+        op = inv[neigh_idx]
+        use_triton = (
+            _HAS_TRITON
+            and self.average == "cc"
+            and device.type == "cuda"
+            and out_dtype == torch.float32
+            and n_inc > 0
+        )
+
+        if use_triton:
+            # Fused Triton fast path for the cc coefficient Jacobian: each
+            # (center, atom) pair maps to at most one edge, so the edge gradient
+            #   g = rvec (x) (Bhat * Y) + B (x) gradY        (all float64)
+            # is computed on the fly and stored (already in the DScribe cc
+            # convention: l=1 (z,x,y) permutation + pi^{-3/2} for l>=2)
+            # straight into the final float32 Jacobian layout — no (E,3,n,L)
+            # edge-gradient tensor, no float64 scatter buffer, no permute /
+            # convention copies, and no zero-init memset (the kernel writes
+            # every output element exactly once). Peak memory drops from ~8 GB
+            # to little more than the output tensor itself for the 300-atom /
+            # n_max=10 / l_max=5 case.
+            deriv = torch.empty((n_rows, n_inc, 3, n_feat), device=device, dtype=out_dtype)
+            valid = op >= 0
+            emap = torch.full((n_rows * n_inc,), -1, device=device, dtype=torch.long)
+            emap[center_idx[valid] * n_inc + op[valid]] = torch.arange(E, device=device)[valid]
+            perm = torch.arange(L, device=device)
+            if self._l_max >= 1:
+                perm[1:4] = torch.tensor([2, 3, 1], device=device)
+            scale = torch.ones(L, device=device, dtype=dtype)
+            scale[4:] = math.pi ** -1.5
+            BLOCK = 1024
+            grid = (n_rows * n_inc, triton.cdiv(3 * n_feat, BLOCK))
+            _cc_jacobian_dense_kernel[grid](
+                rvec.contiguous(),
+                B.contiguous(),
+                Bhat.contiguous(),
+                Yval.contiguous(),
+                Ygrad.contiguous(),
+                emap,
+                neigh_sp.contiguous(),
+                perm.to(torch.int32),
+                l_of_lm.to(torch.int32),
+                scale,
+                deriv,
+                n_feat,
+                NMAX=nmax,
+                LP1=Lp1,
+                LSQ=L,
+                BLOCK=BLOCK,
+            )
+            if return_descriptor:
+                coeffs = [Cc[..., l * l:(l + 1) * (l + 1)] for l in range(Lp1)]
+                desc = self._projection_cc(coeffs).to(out_dtype)
+                return deriv, desc
+            return deriv
+
+        use_triton_ps = (
+            _HAS_TRITON
+            and self.average != "cc"
+            and device.type == "cuda"
+            and out_dtype == torch.float32
+            and n_inc > 0
+        )
+
+        if use_triton_ps:
+            # Fused Triton fast path for the power-spectrum Jacobian
+            # ('off'/'inner'/'outer', all center-wise): the product rule
+            #   d p_{jn,j'n',l}/d x_{a,d} = pref_l sum_m ( dc_{jnlm} c_{j'n'lm}
+            #                                            + c_{jnlm} dc_{j'n'lm} )
+            # is evaluated per (center, atom) pair directly from the edge
+            # quantities and the per-center coefficients Cc, in float64, and
+            # stored once into the final float32 Jacobian. This removes the
+            # (E,3,n,L) edge-gradient tensor, the (C*A*S,3,n,L) float64
+            # scatter buffer, the per-l (C,A,3,S,n,S,n) einsum intermediates
+            # and the float64 output copy of the fallback below (~10 GB peak
+            # for the 300-atom / n_max=10 / l_max=5 case) — peak memory drops
+            # to little more than the float32 output itself.
+            deriv = torch.empty((n_rows, n_inc, 3, n_feat), device=device, dtype=out_dtype)
+            valid = op >= 0
+            emap = torch.full((n_rows * n_inc,), -1, device=device, dtype=torch.long)
+            emap[center_idx[valid] * n_inc + op[valid]] = torch.arange(E, device=device)[valid]
+            fj, fjd, fn, fnd, fl, fpref = self._ps_feat_tables(device)
+            # Per-edge contractions of the coefficient side of the product
+            # rule with the solid harmonics and their gradients: the main
+            # kernel then needs no per-m loop (two FMAs per term instead of a
+            # (2l+1)-point dot product per term).
+            U = torch.empty((E, S * nmax, Lp1), device=device, dtype=dtype)
+            V = torch.empty((E, 3, S * nmax, Lp1), device=device, dtype=dtype)
+            _ps_uv_kernel[(E,)](
+                Yval.contiguous(),
+                Ygrad.contiguous(),
+                Cc.contiguous(),
+                center_idx.contiguous(),
+                U,
+                V,
+                NMAX=nmax,
+                LP1=Lp1,
+                LSQ=L,
+                S=S,
+                M=triton.next_power_of_2(2 * self._l_max + 1),
+                BLOCK=triton.next_power_of_2(S * nmax * Lp1),
+            )
+            BLOCK = 256
+            n_blk = triton.cdiv(3 * n_feat, BLOCK)
+            grid = (n_rows * n_inc * n_blk,)
+            _ps_jacobian_dense_kernel[grid](
+                rvec.contiguous(),
+                B.contiguous(),
+                Bhat.contiguous(),
+                U,
+                V,
+                emap,
+                neigh_sp.contiguous(),
+                fj, fjd, fn, fnd, fl, fpref,
+                deriv,
+                n_feat,
+                n_inc,
+                n_blk,
+                NMAX=nmax,
+                LP1=Lp1,
+                S=S,
+                BLOCK=BLOCK,
+            )
+            if return_descriptor:
+                coeffs = [Cc[..., l * l:(l + 1) * (l + 1)] for l in range(Lp1)]
+                desc = self._power_spectrum(coeffs, self.average).to(out_dtype)
+                return deriv, desc
+            return deriv
+
+        deriv = torch.zeros((n_rows, n_inc, 3, n_feat), device=device, dtype=dtype)
+        B_lm = B[:, :, l_of_lm]        # (E,nmax,L)
+        Bhat_lm = Bhat[:, :, l_of_lm]  # (E,nmax,L)
 
         # edge gradient wrt the NEIGHBOR position (fixed centers: no center term)
         g = (
@@ -1998,7 +2568,6 @@ class SOAP:
 
         # scatter to D[c, a_out, s, 3, n, lm]
         if n_inc > 0:
-            op = inv[neigh_idx]
             valid = op >= 0
             Dacc = torch.zeros((n_centers * n_inc * S, 3, nmax, L), device=device, dtype=dtype)
             if bool(valid.any()):
@@ -2107,7 +2676,7 @@ class SOAP:
             # faster (see derivatives_analytical_ps docstring).
             if (
                 not attach
-                and self._rbf == "gto"
+                and self._rbf in ("gto", "polynomial")
                 and not self.periodic
                 and self._weighting is None
                 and self.average in ("off", "outer", "cc", "inner")
