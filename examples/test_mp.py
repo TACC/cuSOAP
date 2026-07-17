@@ -5,7 +5,7 @@ import torch.multiprocessing as mp
 import time
 import sys
 import math
-from soap_generator import SOAP as PYTORCH_SOAP
+from cusoap import SOAP as PYTORCH_SOAP
 
 #elements
 species = ["H","O"]

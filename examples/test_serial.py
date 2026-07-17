@@ -1,4 +1,4 @@
-from soap_generator import SOAP as PYTORCH_SOAP
+from cusoap import SOAP as PYTORCH_SOAP
 from ase.io import read
 import numpy as np
 import torch

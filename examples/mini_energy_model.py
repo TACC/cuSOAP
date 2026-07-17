@@ -6,7 +6,7 @@ Minimal PyTorch SOAP Energy Model demo: two fully connected layers joined by a R
 
 import torch
 import torch.nn as nn
-from soap_generator import SOAP as PYTORCH_SOAP
+from cusoap import SOAP as PYTORCH_SOAP
 from ase.io import read
 import sys
 

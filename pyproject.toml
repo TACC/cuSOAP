@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cuSOAP"
+version = "0.1.0"
+description = "GPU-accelerated generator of the Smooth Overlap of Atomic Positions (SOAP) descriptor, in PyTorch with fused Triton kernels"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Hongyu Yan" },
+    { name = "Yuqing Xia" },
+    { name = "Yong Wei" },
+    { name = "Minghan Chen" },
+    { name = "Hanning Chen" },
+]
+# corresponding author
+maintainers = [
+    { name = "Hanning Chen" },
+]
+keywords = [
+    "SOAP",
+    "descriptor",
+    "machine learning potentials",
+    "molecular dynamics",
+    "GPU",
+    "PyTorch",
+    "Triton",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "torch>=2.0",
+    "sphericart>=1.0",
+    "sphericart-torch>=1.0",
+    "ase>=3.22",
+]
+
+[project.urls]
+Homepage = "https://github.com/TACC/PYTORCHSOAP"
+Issues = "https://github.com/TACC/PYTORCHSOAP/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
