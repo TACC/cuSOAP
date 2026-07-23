@@ -30,8 +30,8 @@ pip3 install cuSOAP
 From source:
 
 ```bash
-git clone https://github.com/TACC/PYTORCHSOAP
-cd PYTORCHSOAP
+git clone https://github.com/TACC/cuSOAP
+cd cuSOAP
 pip3 install .
 ```
 
