@@ -64,7 +64,6 @@ derivatives = soap.derivatives(molecule, method="analytical", return_descriptor=
 ```bash
 python3 examples/test_serial.py examples/water.xyz    # single CPU/GPU
 python3 examples/test_mp.py examples/water.xyz 4      # one worker per GPU
-python3 examples/mini_energy_model.py examples/water.xyz
 ```
 
 ## Citation
