@@ -4,8 +4,8 @@ GPU-accelerated generator of the Smooth Overlap of Atomic Positions (SOAP)
 descriptor, implemented in PyTorch with fused Triton (PTX) kernels. The API and
 feature ordering are compatible with DScribe's `SOAP`.
 
-On a 30,000-atom system the fused Triton pipeline generates SOAP vectors about
-70x faster than DScribe on a single GPU.
+On a 3,000-atom system, the fused Triton pipeline generates SOAP vectors and their derivatives about
+250x faster than DScribe on a single GPU.
 
 ## Features
 
