@@ -24,12 +24,6 @@ On a 3,000-atom system, the fused Triton pipeline generates SOAP vectors and the
 ## Installation
 
 ```bash
-pip3 install cuSOAP
-```
-
-From source:
-
-```bash
 git clone https://github.com/TACC/cuSOAP
 cd cuSOAP
 pip3 install .
