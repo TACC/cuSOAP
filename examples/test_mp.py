@@ -15,7 +15,7 @@ n_max = 7
 l_max = 3
 periodic = False
 #average = "off", "inner", "outer" or "cc"
-average = "outer"
+average = "off"
 #rbf = "gto" or "polynomial"
 rbf = "gto"
 
@@ -106,19 +106,21 @@ def main():
 
     # timed section: all workers start together, collect all batch results
     start_time = time.perf_counter()
+    torch.cuda.synchronize()
     start_event.set()
     results = {}
     while len(results) < len(tasks):
         msg = result_queue.get()
         _, imol, ibatch, desc, deriv = msg
         results[(imol, ibatch)] = (desc, deriv)
+    torch.cuda.synchronize()
     end_time = time.perf_counter()
     duration_pytorch = end_time - start_time
 
     for p in procs:
         p.join()
 
-    print(f"PYTORCH_SOAP Execution time: {duration_pytorch:.4f} seconds")
+    print(f"cuSOAP Execution time: {duration_pytorch:.4f} seconds")
 
 if __name__ == "__main__":
     main()

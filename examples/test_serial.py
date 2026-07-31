@@ -17,7 +17,7 @@ n_max = 7
 l_max = 3 
 periodic = False
 #average = "off", "inner", "outer" or "cc"
-average = "outer"
+average = "off"
 #rbf = "gto" or "polynomial"
 rbf = "gto"
 
@@ -43,6 +43,7 @@ else:
    centers_batchsize = int(sys.argv[2])
 
 start_time = time.perf_counter()
+torch.cuda.synchronize()
 for i, molecule in enumerate(molecules):
  num_atoms = len(molecule)
  if not is_batched:
@@ -60,8 +61,9 @@ for i, molecule in enumerate(molecules):
     pytorch_soap_tensor = torch.cat(pytorch_soap_list)
     pytorch_soap_derivatives_tensor = torch.cat(pytorch_soap_derivatives_list)
 
+torch.cuda.synchronize()
 end_time = time.perf_counter()
 duration_pytorch = end_time - start_time
-print(f"PYTORCH_SOAP Execution time: {duration_pytorch:.12f} seconds")
+print(f"cuSOAP Execution time: {duration_pytorch:.12f} seconds")
 
 
