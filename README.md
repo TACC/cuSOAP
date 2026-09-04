@@ -95,7 +95,7 @@ python3 examples/test_mp.py examples/water.xyz 4      # one worker per GPU
 
 ## Single-GPU Performance
 ![Single-GPU](./figures/cusoap_speedup.jpeg)
-Speedup factor of cuSOAP over DSCribe for the generation of the atom-wise SOAP vectors and their derivatives for (H<sub>2</sub>O)<sub>1000</sub> clusters, as a function of the radial basis size, n<sub>max</sub>=1-7 and the angular band limit l<sub>max</sub>=0-3. 
+Speedup factor of cuSOAP over DSCribe for the generation of the atom-wise SOAP vectors and their derivatives for (H<sub>2</sub>O)<sub>1000</sub> clusters, as a function of the radial basis size, <i>n<sub>max</sub>=1-7<\i> and the angular band limit <i>l<sub>max</sub>=0-3<\i>. 
 
 ## Citation
 
