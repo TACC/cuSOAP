@@ -28,9 +28,38 @@ Install the Pytorch package corresponding to your operating system and CUDA vers
 For example, on the Texas Advanced Computing Center's Horizon cluster, the installation of CUDA-enabled Pytorch can be accomplished by the following commands: 
 
 ```bash
+module purge
+module reset
+module load gcc/15.3.0
+module load cuda/13.2
+
+export TORCH_CUDA_ARCH_LIST="8.9 9.0 10.0 11.0 10.3 12.0 12.1"
+export ENVNAME=cudasoapenv
+
+cds
+rm -rf $ENVNAME
+python3 -m venv $ENVNAME && source $ENVNAME/bin/activate
+
+pip3 cache purge
+python3 -m pip install --upgrade pip
+python3 -m pip install --upgrade setuptools
+pip3 install torch==2.14.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu132
+
+git clone https://github.com/lab-cosmo/sphericart
+cd sphericart
+pip3 install .[torch]
+cd ..
+
+git clone https://github.com/SINGROUP/dscribe.git
+cd dscribe
+git submodule update --init
+pip3 install .
+cd ..
+
 git clone https://github.com/TACC/cuSOAP
 cd cuSOAP
 pip3 install .
+cd ..
 ```
 
 Requirements: Python >= 3.9, PyTorch >= 2.0, sphericart + sphericart-torch, ASE.
