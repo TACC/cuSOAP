@@ -23,6 +23,10 @@ On a 3,000-atom system, the fused Triton pipeline generates SOAP vectors and the
 
 ## Installation
 
+Install the Pytorch package corresponding to your operating system and CUDA version if NVIDIA GPUs are available.
+
+For example, on the Texas Advanced Computing Center's Horizon cluster, the installation of CUDA-enabled Pytorch can be accomplished by the following commands: 
+
 ```bash
 git clone https://github.com/TACC/cuSOAP
 cd cuSOAP
